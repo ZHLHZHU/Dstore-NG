@@ -7,6 +7,7 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -57,6 +58,13 @@ class FileManager {
             return Optional.empty();
         }
         return Optional.of(file);
+    }
+
+    public List<String> list() {
+        return fileMap.values().stream()
+                .filter(FileHandler::visible)
+                .map(FileHandler::getFileName)
+                .toList();
     }
 }
 
@@ -167,6 +175,10 @@ class ClientHandler implements Runnable, Exchangeable {
 
     private final Map<FileHandler, Set<DstorePeer>> latestLoadDstores = new HashMap<>();
 
+    private AtomicReference<String> waitStoreFile = new AtomicReference<>();
+
+    private AtomicReference<String> waitRemoveFile = new AtomicReference<>();
+
     public ClientHandler(BlockingQueue<Map.Entry<Peer.InMessageType, String>> inQueue, BlockingQueue<Map.Entry<Peer.OutMessageType, String>> outQueue) {
         this.inQueue = inQueue;
         this.outQueue = outQueue;
@@ -177,6 +189,14 @@ class ClientHandler implements Runnable, Exchangeable {
         while (true) {
             try {
                 Map.Entry<Peer.InMessageType, String> res = inQueue.take();
+                switch (res.getKey()) {
+                    case REQ:
+                        dispatchReq(res.getValue());
+                        break;
+                    case EVENT:
+                        broadcast(res.getValue());
+                        break;
+                }
                 Log.INFO.log("Received message: %s", res);
             } catch (InterruptedException e) {
                 Log.ERROR.log("Error while taking message from inQueue");
@@ -184,7 +204,7 @@ class ClientHandler implements Runnable, Exchangeable {
         }
     }
 
-    public void dispatch(String message) throws InterruptedException {
+    public void dispatchReq(String message) throws InterruptedException {
         final String[] tokens = message.split(" ");
         final String opt = tokens[0];
         switch (opt) {
@@ -197,17 +217,15 @@ class ClientHandler implements Runnable, Exchangeable {
                 break;
 
             case Protocol.REMOVE_TOKEN:
-//                onClientRemove(tokens);
+                onClientRemove(tokens[1]);
                 break;
             case Protocol.LIST_TOKEN:
-//                onList();
+                onList();
                 break;
-
             default:
                 Log.ERROR.log("Unknown message: %s", message);
         }
     }
-
 
     private void onClientStore(String filename, long fileSize) throws InterruptedException {
         if (AnyDoor.onlineDstores.size() < AnyDoor.replicate.intValue()) {
@@ -230,6 +248,7 @@ class ClientHandler implements Runnable, Exchangeable {
         if (file.getLock().tryLock()) {
             try {
                 file.getWaitingDstores().addAll(AnyDoor.onlineDstores.stream().limit(AnyDoor.replicate.intValue()).toList());
+                waitStoreFile.set(filename);
             } finally {
                 file.getLock().unlock();
             }
@@ -259,7 +278,66 @@ class ClientHandler implements Runnable, Exchangeable {
         res(String.format("%s %s %s", Protocol.LOAD_FROM_TOKEN, _dstorePeer.get().getPort(), file.getFileSize()));
     }
 
+    private void onClientRemove(String filename) throws InterruptedException {
+        if (AnyDoor.onlineDstores.size() < AnyDoor.replicate.intValue()) {
+            Log.ERROR.log("No Dstores available");
+            res(Protocol.ERROR_NOT_ENOUGH_DSTORES_TOKEN);
+            return;
+        }
+        Optional<FileHandler> _file = AnyDoor.fileManager.fetch(filename);
+        if (_file.isEmpty()) {
+            res(Protocol.REMOVE_COMPLETE_TOKEN);
+            return;
+        }
+        FileHandler file = _file.get();
+        if (file.getLock().tryLock()) {
+            try {
+                file.getStatus().set(2);
+                waitRemoveFile.set(filename);
+                try {
+                    file.getOnDstores().forEach(dstore -> {
+                        try {
+                            dstore.inQueue.put(new AbstractMap.SimpleImmutableEntry<>(
+                                    Peer.InMessageType.EVENT,
+                                    String.format("%s %s", Protocol.REMOVE_TOKEN, filename)));
+                        } catch (InterruptedException e) {
+                            Log.ERROR.log("Error while broadcasting remove message");
+                        }
+                    });
+                } catch (Exception e) {
+                    Log.ERROR.log("Error while broadcasting remove message");
+                }
+            } finally {
+                file.getLock().unlock();
+            }
+        }
+    }
 
+    private void onList() throws InterruptedException {
+        if (AnyDoor.onlineDstores.size() < AnyDoor.replicate.intValue()) {
+            Log.ERROR.log("No Dstores available");
+            res(Protocol.ERROR_NOT_ENOUGH_DSTORES_TOKEN);
+            return;
+        }
+        List<String> fileList = AnyDoor.fileManager.list();
+        if (fileList.isEmpty()) {
+            res(Protocol.LIST_TOKEN);
+        } else {
+            res(String.join("%s ", Protocol.LIST_TOKEN, String.join(" ", fileList)));
+        }
+    }
+
+    private void dispatchEvent(String message) {
+        final String[] tokens = message.split(" ");
+        final String opt = tokens[0];
+        switch (opt) {
+            case Protocol.STORE_ACK_TOKEN:
+                onStoreAck(tokens[1]);
+                break;
+            default:
+                Log.ERROR.log("Unknown message: %s", message);
+        }
+    }
 
     @Override
     public BlockingQueue<Map.Entry<Peer.OutMessageType, String>> getOutQueue() {
@@ -315,6 +393,10 @@ class FileHandler {
     public FileHandler(String fileName, long fileSize) {
         this.fileName = fileName;
         this.fileSize = fileSize;
+    }
+
+    public String getFileName() {
+        return fileName;
     }
 
     public Lock getLock() {
