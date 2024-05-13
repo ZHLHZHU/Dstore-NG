@@ -4,12 +4,15 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 public class Controller {
 
@@ -22,7 +25,9 @@ class AnyDoor {
 
     public static long timeout = 1000;
 
-    public static final List<DstorePeer> onlineDstores = new CopyOnWriteArrayList<>();
+    public static final Map<Integer, DstorePeer> onlineDstores = new ConcurrentHashMap<>();
+
+    public static final List<ClientPeer> onlineClients = new CopyOnWriteArrayList<>();
 
     public static final AtomicInteger replicate = new AtomicInteger(0);
 
@@ -54,7 +59,7 @@ class FileManager {
 
     public Optional<FileHandler> fetch(String filename) {
         FileHandler file = fileMap.get(filename);
-        if (file == null || file.visible() || file.expired()) {
+        if (file == null || file.visible() || file.expired(System.currentTimeMillis())) {
             return Optional.empty();
         }
         return Optional.of(file);
@@ -65,6 +70,22 @@ class FileManager {
                 .filter(FileHandler::visible)
                 .map(FileHandler::getFileName)
                 .toList();
+    }
+
+    public void updateFromDstore(List<String> fileLists, int dstorePort) {
+        long now = System.currentTimeMillis();
+
+        DstorePeer dstorePeer = AnyDoor.onlineDstores.get(dstorePort);
+        Set<String> onDstoreFiles = fileMap.values().stream().filter(f -> f.getOnDstores().contains(dstorePeer)).map(FileHandler::getFileName).collect(Collectors.toSet());
+
+        Set<String> willRemove = new HashSet<>(onDstoreFiles);
+        fileLists.forEach(willRemove::remove);
+
+        Set<String> willAdd = new HashSet<>(fileLists);
+        willAdd.removeAll(onDstoreFiles);
+
+        willRemove.stream().map(fileMap::get).forEach(f -> f.removeDstore(dstorePeer));
+        willAdd.forEach(f -> fileMap.get(f).getOnDstores().add(dstorePeer));
     }
 }
 
@@ -122,7 +143,7 @@ class DstorePeer extends Peer {
     public DstorePeer(Socket socket, int port) throws IOException {
         super(socket);
         this.port = port;
-        Thread handler = new Thread(new DstoreHandler(inQueue, outQueue));
+        Thread handler = new Thread(new DstoreHandler(inQueue, outQueue, port));
         handler.start();
     }
 
@@ -131,14 +152,19 @@ class DstorePeer extends Peer {
     }
 }
 
-class DstoreHandler implements Runnable {
+class DstoreHandler implements Runnable, Exchangeable {
+
+    private final Integer port;
 
     private final BlockingQueue<Map.Entry<Peer.InMessageType, String>> inQueue;
     private final BlockingQueue<Map.Entry<Peer.OutMessageType, String>> outQueue;
 
-    public DstoreHandler(BlockingQueue<Map.Entry<Peer.InMessageType, String>> inQueue, BlockingQueue<Map.Entry<Peer.OutMessageType, String>> outQueue) {
+    public DstoreHandler(BlockingQueue<Map.Entry<Peer.InMessageType, String>> inQueue,
+                         BlockingQueue<Map.Entry<Peer.OutMessageType, String>> outQueue,
+                         int port) {
         this.inQueue = inQueue;
         this.outQueue = outQueue;
+        this.port = port;
     }
 
     @Override
@@ -153,11 +179,109 @@ class DstoreHandler implements Runnable {
         }
     }
 
-
-    private void onStoreAck(String filename) {
-
+    public void dispatchReq(String message) {
+        final String[] tokens = message.split(" ");
+        final String opt = tokens[0];
+        switch (opt) {
+            case Protocol.STORE_ACK_TOKEN:
+                onStoreAck(tokens[1]);
+                break;
+            case Protocol.REMOVE_ACK_TOKEN:
+                onRemoveAck(tokens[1]);
+                break;
+            case Protocol.LIST_TOKEN:
+                final List<String> fileNames = tokens.length > 1 ? Arrays.stream(tokens).skip(1).toList()
+                        : Collections.emptyList();
+                onList(fileNames);
+                break;
+            case Protocol.REBALANCE_COMPLETE_TOKEN:
+            case Protocol.ERROR_FILE_DOES_NOT_EXIST_TOKEN:
+                Log.INFO.log("Received message: %s", message);
+            default:
+                Log.ERROR.log("Unknown message: %s", message);
+        }
     }
 
+    public void dispatchEvent(String message) {
+        final String[] tokens = message.split(" ");
+        final String opt = tokens[0];
+        switch (opt) {
+            default:
+                Log.ERROR.log("Unknown message: %s", message);
+        }
+    }
+
+    private void onList(List<String> fileLists) {
+        AnyDoor.fileManager.updateFromDstore(fileLists, port);
+        // TODO notify controller
+    }
+
+    private void onStoreAck(String filename) {
+        Optional<FileHandler> _file = AnyDoor.fileManager.fetch(filename);
+        DstorePeer dstorePeer = AnyDoor.onlineDstores.get(port);
+        if (_file.isEmpty() || dstorePeer == null) {
+            Log.ERROR.log("File or Dstore not found: %s %s", filename, port);
+            return;
+        }
+        FileHandler file = _file.get();
+        if (file.getLock().tryLock()) {
+            try {
+                if (file.ackStore(dstorePeer)) {
+                    try {
+                        AnyDoor.onlineClients.forEach(client -> {
+                            try {
+                                client.inQueue.put(new AbstractMap.SimpleImmutableEntry<>(
+                                        Peer.InMessageType.EVENT,
+                                        String.format("%s %s", Protocol.STORE_COMPLETE_TOKEN, filename)));
+                            } catch (InterruptedException e) {
+                                Log.ERROR.log("Error while broadcasting store complete message");
+                            }
+                        });
+                    } catch (Exception e) {
+                        Log.ERROR.log("Error while broadcasting store complete message");
+                    }
+                }
+            } finally {
+                file.getLock().unlock();
+            }
+        }
+    }
+
+    private void onRemoveAck(String filename) {
+        Optional<FileHandler> _file = AnyDoor.fileManager.fetch(filename);
+        DstorePeer dstorePeer = AnyDoor.onlineDstores.get(port);
+        if (_file.isEmpty() || dstorePeer == null) {
+            Log.ERROR.log("File or Dstore not found: %s %s", filename, port);
+            return;
+        }
+        FileHandler file = _file.get();
+        if (file.getLock().tryLock()) {
+            try {
+                if (file.ackRemove(dstorePeer)) {
+                    try {
+                        AnyDoor.onlineClients.forEach(client -> {
+                            try {
+                                client.inQueue.put(new AbstractMap.SimpleImmutableEntry<>(
+                                        Peer.InMessageType.EVENT,
+                                        String.format("%s %s", Protocol.REMOVE_COMPLETE_TOKEN, filename)));
+                            } catch (InterruptedException e) {
+                                Log.ERROR.log("Error while broadcasting remove complete message");
+                            }
+                        });
+                    } catch (Exception e) {
+                        Log.ERROR.log("Error while broadcasting remove complete message");
+                    }
+                }
+            } finally {
+                file.getLock().unlock();
+            }
+        }
+    }
+
+    @Override
+    public BlockingQueue<Map.Entry<Peer.OutMessageType, String>> getOutQueue() {
+        return outQueue;
+    }
 }
 
 
@@ -194,7 +318,7 @@ class ClientHandler implements Runnable, Exchangeable {
                         dispatchReq(res.getValue());
                         break;
                     case EVENT:
-                        broadcast(res.getValue());
+                        dispatchEvent(res.getValue());
                         break;
                 }
                 Log.INFO.log("Received message: %s", res);
@@ -247,7 +371,7 @@ class ClientHandler implements Runnable, Exchangeable {
         FileHandler file = _file.get();
         if (file.getLock().tryLock()) {
             try {
-                file.getWaitingDstores().addAll(AnyDoor.onlineDstores.stream().limit(AnyDoor.replicate.intValue()).toList());
+                file.getWaitingDstores().addAll(AnyDoor.onlineDstores.values().stream().limit(AnyDoor.replicate.intValue()).toList());
                 waitStoreFile.set(filename);
             } finally {
                 file.getLock().unlock();
@@ -331,11 +455,33 @@ class ClientHandler implements Runnable, Exchangeable {
         final String[] tokens = message.split(" ");
         final String opt = tokens[0];
         switch (opt) {
-            case Protocol.STORE_ACK_TOKEN:
-                onStoreAck(tokens[1]);
+            case Protocol.STORE_COMPLETE_TOKEN:
+                onStoreComplete(tokens[1]);
                 break;
             default:
                 Log.ERROR.log("Unknown message: %s", message);
+        }
+    }
+
+    private void onStoreComplete(String filename) {
+        if (waitStoreFile.get().equals(filename)) {
+            waitStoreFile.set(null);
+            try {
+                res(Protocol.STORE_COMPLETE_TOKEN);
+            } catch (InterruptedException e) {
+                Log.ERROR.log("Error while sending store complete message");
+            }
+        }
+    }
+
+    private void onRemoveComplete(String filename) {
+        if (waitRemoveFile.get().equals(filename)) {
+            waitRemoveFile.set(null);
+            try {
+                res(Protocol.REMOVE_COMPLETE_TOKEN);
+            } catch (InterruptedException e) {
+                Log.ERROR.log("Error while sending remove complete message");
+            }
         }
     }
 
@@ -419,7 +565,7 @@ class FileHandler {
         return fileSize;
     }
 
-    public boolean ack(DstorePeer dstore) {
+    public boolean ackStore(DstorePeer dstore) {
         waitingDstores.remove(dstore);
         onDstores.add(dstore);
         if (waitingDstores.isEmpty()) {
@@ -429,12 +575,27 @@ class FileHandler {
         return false;
     }
 
-    public boolean expired() {
-        return System.currentTimeMillis() - addedTime > AnyDoor.timeout;
+    public boolean ackRemove(DstorePeer dstore) {
+        waitingDstores.remove(dstore);
+        onDstores.remove(dstore);
+        if (onDstores.isEmpty()) {
+            status.set(2);
+            return true;
+        }
+        return false;
+    }
+
+    public boolean expired(long now) {
+        return now - addedTime > AnyDoor.timeout;
     }
 
     public boolean visible() {
         return status.get() == 1;
+    }
+
+    public void removeDstore(DstorePeer dstorePeer) {
+        onDstores.remove(dstorePeer);
+        waitingDstores.remove(dstorePeer);
     }
 }
 
