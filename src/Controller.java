@@ -91,11 +91,11 @@ class FileManager {
 
 class Peer {
 
-    private final Socket socket;
+    final Socket socket;
 
-    private final BufferedReader in;
+    protected final BufferedReader in;
 
-    private final PrintWriter out;
+    protected final PrintWriter out;
 
     public final BlockingQueue<Map.Entry<InMessageType, String>> inQueue = new LinkedBlockingQueue<>();
     protected final BlockingQueue<Map.Entry<OutMessageType, String>> outQueue = new LinkedBlockingQueue<>();
@@ -136,6 +136,38 @@ class Peer {
     }
 }
 
+class UnknownPeer extends Peer {
+
+    public UnknownPeer(Socket socket) throws IOException {
+        super(socket);
+    }
+
+    @Override
+    public void receiveMessage() {
+        try {
+            String message = in.readLine();
+            if (message == null) {
+                return;
+            }
+            if (message.startsWith(Protocol.JOIN_TOKEN)) {
+                final int clientPort = Integer.parseInt(message.split(" ")[1]);
+                Log.INFO.log("Client %s connected", clientPort);
+                // evolute to Dstore
+                DstorePeer dstorePeer = DstorePeer.from(this, clientPort, message);
+
+                if (AnyDoor.onlineDstores.size() >= AnyDoor.replicate.intValue()) {
+                    // TODO trigger rebalance
+                }
+            }
+        } catch (IOException e) {
+            Log.ERROR.log("Error while reading message from socket");
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        }
+
+    }
+}
+
 class DstorePeer extends Peer {
 
     private final Integer port;
@@ -149,6 +181,12 @@ class DstorePeer extends Peer {
 
     public Integer getPort() {
         return port;
+    }
+
+    public static DstorePeer from(UnknownPeer peer, int port, String firstMessage) throws IOException, InterruptedException {
+        DstorePeer dstorePeer = new DstorePeer(peer.socket, port);
+        dstorePeer.inQueue.put(new AbstractMap.SimpleImmutableEntry<>(InMessageType.REQ, firstMessage));
+        return dstorePeer;
     }
 }
 
@@ -289,6 +327,8 @@ class ClientPeer extends Peer {
 
     public ClientPeer(Socket socket) throws IOException {
         super(socket);
+        Thread handler = new Thread(new ClientHandler(inQueue, outQueue));
+        handler.start();
     }
 }
 
