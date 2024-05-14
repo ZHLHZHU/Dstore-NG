@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.IntStream;
 
 public class Dstore {
 
@@ -105,7 +106,7 @@ class ControllerHandler implements Runnable {
                 }
                 final String[] tokens = line.split(" ");
                 final String command = tokens[0];
-
+                Log1.INFO.log("[Controller] received: %s", line);
                 switch (command) {
                     case Protocol.REMOVE_TOKEN:
                         onControllerRemove(tokens);
@@ -148,12 +149,10 @@ class ControllerHandler implements Runnable {
         Map<String, List<String>> filesToSend = new HashMap<>();
         for (int i = 0; i < sendNum; i++) {
             String file = tokens[startIndex++];
-            int destNum = Integer.parseInt(tokens[startIndex++]);
-            List<String> dests = new ArrayList<>();
-            for (int j = 0; j < destNum; j++) {
-                dests.add(tokens[startIndex++]);
-            }
-            filesToSend.put(file, dests);
+            final int destNum = Integer.parseInt(tokens[startIndex++]);
+            Arrays.stream(tokens).skip(startIndex)
+                    .limit(destNum)
+                    .forEach(to -> filesToSend.computeIfAbsent(file, k -> new ArrayList<>()).add(to));
         }
 
         int removeNum = Integer.parseInt(tokens[startIndex++]);
@@ -162,7 +161,6 @@ class ControllerHandler implements Runnable {
             filesToRemove.add(tokens[startIndex++]);
         }
 
-        // transfer files
         final List<Thread> threads = new ArrayList<>();
         for (Map.Entry<String, List<String>> entry : filesToSend.entrySet()) {
             String file = entry.getKey();
@@ -175,9 +173,9 @@ class ControllerHandler implements Runnable {
             for (String dest : entry.getValue()) {
                 final Thread thread = new Thread(() -> {
                     try (var socket = new Socket("localhost", Integer.parseInt(dest))) {
-                        var rec = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-                        var sender = new PrintWriter(socket.getOutputStream(), true);
+                        PrintWriter sender = new PrintWriter(socket.getOutputStream(), true);
                         sender.println(Protocol.REBALANCE_STORE_TOKEN + " " + file + " " + _fileSize.get());
+                        BufferedReader rec = new BufferedReader(new InputStreamReader(socket.getInputStream()));
                         final String res = rec.readLine();
                         if (res == null || !res.equals(Protocol.ACK_TOKEN)) {
                             return;
@@ -254,13 +252,11 @@ class RecClient implements Runnable {
                 final String command = tokens[0];
                 switch (command) {
                     case Protocol.STORE_TOKEN:
+                    case Protocol.REBALANCE_STORE_TOKEN:
                         onStore(tx, inputStream, tokens);
                         break;
                     case Protocol.LOAD_DATA_TOKEN:
-                        onLoadData(tx, outputStream, tokens);
-                        break;
-                    case Protocol.REBALANCE_STORE_TOKEN:
-                        onBalanceStore(tx, inputStream, tokens);
+                        onLoadData(tx, outputStream, tokens[1]);
                         break;
                     default:
                         Log1.ERROR.log("[Dstore] unknown command: %s", command);
@@ -278,17 +274,16 @@ class RecClient implements Runnable {
         }
     }
 
-    private void onLoadData(PrintWriter tx, OutputStream rawTx, String[] tokens) {
-        final String fileName = tokens[1];
+    private void onLoadData(PrintWriter sender, OutputStream outputStream, String fileName) {
         final var _fileContent = Dstore.fileManager.fetchBytes(fileName);
         if (_fileContent.isEmpty()) {
-            tx.println(Protocol.ERROR_FILE_DOES_NOT_EXIST_TOKEN);
+            sender.println(Protocol.ERROR_FILE_DOES_NOT_EXIST_TOKEN);
             return;
         }
         final Byte[] fileContent = _fileContent.get();
         try {
-            rawTx.write(toPrimitive(fileContent));
-            rawTx.flush();
+            outputStream.write(toPrimitive(fileContent));
+            outputStream.flush();
         } catch (IOException e) {
             Log1.ERROR.log("[Dstore] failed to send file data: %s", e.getMessage());
         }
@@ -320,10 +315,6 @@ class RecClient implements Runnable {
         }
         Dstore.fileManager.save(filename, bufferStream.toByteArray());
         ControllerHandler.controllerSender.println(Protocol.STORE_ACK_TOKEN + " " + filename);
-    }
-
-    private void onBalanceStore(PrintWriter tx, InputStream rawRx, String[] tokens) throws IOException {
-        onStore(tx, rawRx, tokens);
     }
 
     public byte[] toPrimitive(Byte[] byteObjects) {
@@ -360,9 +351,7 @@ class DstoreFileManager {
         return fileMap;
     }
 
-    /**
-     * store file
-     */
+
     public boolean save(String filename, byte[] fileContent) {
         // create file with content
         final File file = new File(baseDir + "/" + filename);

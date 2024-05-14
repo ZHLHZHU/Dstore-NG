@@ -1,11 +1,11 @@
 import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CopyOnWriteArraySet;
@@ -15,7 +15,9 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Collectors;
 
 enum Log {
@@ -44,10 +46,6 @@ interface Handler extends Runnable {
         getOutQueue().put(new AbstractMap.SimpleImmutableEntry<>(Peer.OutMessageType.RES, message));
     }
 
-    default void broadcast(String message) throws InterruptedException {
-        getOutQueue().put(new AbstractMap.SimpleImmutableEntry<>(Peer.OutMessageType.BROADCAST, message));
-    }
-
     BlockingQueue<Map.Entry<Peer.InMessageType, String>> getInQueue();
 
     BlockingQueue<Map.Entry<Peer.OutMessageType, String>> getOutQueue();
@@ -62,8 +60,8 @@ public class Controller {
         AnyDoor.timeout = Long.parseLong(args[2]);
         AnyDoor.rebalanced_period = Integer.parseInt(args[3]);
 
-        // cleanup expired files
-        AnyDoor.fileManager.timer(AnyDoor.timeout * 2);
+        // rebalance
+        AnyDoor.rebalanceManager.timer();
 
         ServerSocket serverSocket = new ServerSocket(AnyDoor.port);
         Log.INFO.log("Controller started at port %d", AnyDoor.port);
@@ -90,7 +88,6 @@ class Peer {
     protected final PrintWriter out;
     protected final InputStream inputStream;
     protected final OutputStream outputStream;
-    private final Socket socket;
     /**
      * 0 dstore; 1 client
      */
@@ -99,7 +96,6 @@ class Peer {
     private Handler handler;
 
     public Peer(Socket socket) throws IOException {
-        this.socket = socket;
         this.inputStream = socket.getInputStream();
         this.outputStream = socket.getOutputStream();
         this.in = new BufferedReader(new InputStreamReader(inputStream));
@@ -181,7 +177,6 @@ class Peer {
         int dstorePort = Integer.parseInt(message.split(" ")[1]);
         DstoreHandler newDstore = new DstoreHandler(inQueue, outQueue, dstorePort);
         AnyDoor.onlineDstores.put(dstorePort, newDstore);
-        // TODO rebalance on join
         return newDstore;
     }
 
@@ -210,6 +205,8 @@ class AnyDoor {
     public static final Map<Integer, DstoreHandler> onlineDstores = new ConcurrentHashMap<>();
     public static final List<ClientHandler> onlineClients = new CopyOnWriteArrayList<>();
     public static final FileManager fileManager = new FileManager();
+    public static final RebalanceManager rebalanceManager = new RebalanceManager();
+    public static ReadWriteLock rebalanceLock = new ReentrantReadWriteLock();
     public static int port;
     public static int replicate;
     public static int rebalanced_period;
@@ -220,7 +217,7 @@ class AnyDoor {
 
 class FileManager {
 
-    private final Map<String, FileHandler> fileMap = new HashMap<>();
+    private final Map<String, FileHandler> fileMap = new ConcurrentHashMap<>();
 
 
     public boolean contains(String filename) {
@@ -257,8 +254,6 @@ class FileManager {
     }
 
     public void updateFromDstore(List<String> fileLists, int dstorePort) {
-        long now = System.currentTimeMillis();
-
         DstoreHandler dstorePeer = AnyDoor.onlineDstores.get(dstorePort);
         Set<String> onDstoreFiles = fileMap.values().stream().filter(f -> f.getOnDstores().contains(dstorePeer)).map(FileHandler::getFileName).collect(Collectors.toSet());
 
@@ -272,22 +267,10 @@ class FileManager {
         willAdd.forEach(f -> fileMap.get(f).getOnDstores().add(dstorePeer));
     }
 
-    public void timer(long interval) {
-        Executors.newSingleThreadScheduledExecutor().scheduleAtFixedRate(() -> {
-            long now = System.currentTimeMillis();
-            fileMap.values().stream()
-                    .filter(f -> f.expired(now) && !f.visible())
-                    .forEach(f -> {
-                        if (f.getLock().tryLock()) {
-                            try {
-                                fileMap.remove(f.getFileName());
-                            } finally {
-                                f.getLock().unlock();
-                            }
-                        }
-                    });
-        }, 0, interval, java.util.concurrent.TimeUnit.MILLISECONDS);
+    public void remove(String filename) {
+        fileMap.remove(filename);
     }
+
 }
 
 class DstoreHandler implements Handler {
@@ -356,8 +339,15 @@ class DstoreHandler implements Handler {
             case Protocol.REMOVE_TOKEN:
                 listenRemove(tokens[1]);
                 break;
+            case Protocol.REBALANCE_TOKEN:
+                listenRebalance(message);
+                break;
+            case Protocol.LIST_TOKEN:
+                listenRebalanceList();
+                break;
             default:
                 Log.ERROR.log("Unknown message: %s", message);
+                break;
         }
     }
 
@@ -370,6 +360,11 @@ class DstoreHandler implements Handler {
         AnyDoor.fileManager.updateFromDstore(fileLists, port);
         // TODO notify controller
     }
+
+    private void listenRebalanceList() throws InterruptedException {
+        res(Protocol.LIST_TOKEN);
+    }
+
 
     private void onStoreAck(String filename) {
         Optional<FileHandler> _file = AnyDoor.fileManager.fetch(filename);
@@ -404,15 +399,14 @@ class DstoreHandler implements Handler {
 
     private void onRemoveAck(String filename) {
         Optional<FileHandler> _file = AnyDoor.fileManager.fetch(filename);
-        DstoreHandler dstorePeer = AnyDoor.onlineDstores.get(port);
-        if (_file.isEmpty() || dstorePeer == null) {
+        if (_file.isEmpty()) {
             Log.ERROR.log("File or Dstore not found: %s %s", filename, port);
             return;
         }
         FileHandler file = _file.get();
         if (file.getLock().tryLock()) {
             try {
-                if (file.ackRemove(dstorePeer)) {
+                if (file.ackRemove(this)) {
                     try {
                         file.getWaitingClient().getInQueue().put(new AbstractMap.SimpleImmutableEntry<>(
                                 Peer.InMessageType.EVENT,
@@ -430,6 +424,11 @@ class DstoreHandler implements Handler {
     private void listenRemove(String filename) throws InterruptedException {
         Log.TRACE.log("Received remove message: %s", filename);
         res(Protocol.REMOVE_TOKEN + " " + filename);
+    }
+
+    private void listenRebalance(String message) throws InterruptedException {
+        Log.TRACE.log("Received rebalance message: %s", message);
+        res(message);
     }
 
     @Override
@@ -461,8 +460,10 @@ class ClientHandler implements Handler {
     @Override
     public void run() {
         while (true) {
+            final Lock readLock = AnyDoor.rebalanceLock.readLock();
             try {
                 Map.Entry<Peer.InMessageType, String> res = inQueue.take();
+                readLock.lock();
                 switch (res.getKey()) {
                     case REQ:
                         dispatchReq(res.getValue());
@@ -475,6 +476,8 @@ class ClientHandler implements Handler {
             } catch (InterruptedException e) {
                 Log.ERROR.log("Error while taking message from inQueue");
                 break;
+            } finally {
+                readLock.unlock();
             }
         }
     }
@@ -558,19 +561,26 @@ class ClientHandler implements Handler {
     }
 
     private void onClientRemove(String filename) throws InterruptedException {
+        Log.TRACE.log("×Remove request: %s", filename);
         if (AnyDoor.onlineDstores.size() < AnyDoor.replicate) {
             res(Protocol.ERROR_NOT_ENOUGH_DSTORES_TOKEN);
             return;
         }
         Optional<FileHandler> _file = AnyDoor.fileManager.fetch(filename);
-        if (_file.isEmpty()) {
-            res(Protocol.REMOVE_COMPLETE_TOKEN);
+        if (_file.isEmpty() || _file.get().getStatus().intValue() != 1) {
+            res(Protocol.ERROR_FILE_DOES_NOT_EXIST_TOKEN);
             return;
         }
         FileHandler file = _file.get();
         if (file.getLock().tryLock()) {
+            Log.TRACE.log("×Remove request: %s success acquire lock", filename);
             try {
+                if (file.getStatus().intValue() != 1) {
+                    res(Protocol.ERROR_FILE_DOES_NOT_EXIST_TOKEN);
+                    return;
+                }
                 file.getStatus().set(2);
+                file.setWaitingClient(this);
                 waitRemoveFile.set(filename);
                 try {
                     file.getOnDstores().forEach(dstore -> {
@@ -588,6 +598,10 @@ class ClientHandler implements Handler {
             } finally {
                 file.getLock().unlock();
             }
+        } else {
+            Log.TRACE.log("×Remove request: %s failed acquire lock", filename);
+            res(Protocol.ERROR_FILE_DOES_NOT_EXIST_TOKEN);
+            return;
         }
     }
 
@@ -603,9 +617,10 @@ class ClientHandler implements Handler {
         } else {
             res(Protocol.LIST_TOKEN + " " + String.join(" ", fileList));
         }
+        AnyDoor.rebalanceManager.addRebalanceResCount(LocalDateTime.now());
     }
 
-    public void dispatchEvent(String message) {
+    public void dispatchEvent(String message) throws InterruptedException {
         final String[] tokens = message.split(" ");
         final String opt = tokens[0];
         switch (opt) {
@@ -626,7 +641,7 @@ class ClientHandler implements Handler {
     }
 
     private void listenStoreComplete(String filename) {
-        if (waitStoreFile.get().equals(filename)) {
+        if (Objects.equals(waitStoreFile.get(), filename)) {
             waitStoreFile.set(null);
             try {
                 res(Protocol.STORE_COMPLETE_TOKEN);
@@ -637,13 +652,15 @@ class ClientHandler implements Handler {
     }
 
     private void listenRemoveComplete(String filename) {
-        if (waitRemoveFile.get().equals(filename)) {
+        Log.TRACE.log("Received remove complete message: %s", filename);
+        if (Objects.equals(waitRemoveFile.get(), filename)) {
             waitRemoveFile.set(null);
             try {
                 res(Protocol.REMOVE_COMPLETE_TOKEN);
             } catch (InterruptedException e) {
                 Log.ERROR.log("Error while sending remove complete message");
             }
+            AnyDoor.fileManager.remove(filename);
         }
     }
 
@@ -743,32 +760,85 @@ class FileHandler {
     public ClientHandler getWaitingClient() {
         return waitingClient;
     }
+
+    public void setWaitingClient(ClientHandler client) {
+        this.waitingClient = client;
+    }
 }
 
 
 class RebalanceManager {
 
+    private static final AtomicInteger rebalanceResCount = new AtomicInteger(0);
 
-    public boolean startRebalance(String source) {
-        Log.INFO.log("Rebalancing from %s", source)
-        ;
+    private static LocalDateTime lastTriggerTime = null;
+
+    public static void addRebalanceResCount(LocalDateTime now) {
+        if (lastTriggerTime == null) {
+            return;
+        }
+        if (Duration.between(lastTriggerTime, now).toMillis() > AnyDoor.rebalanced_period) {
+            rebalanceResCount.set(0);
+            lastTriggerTime = null;
+            return;
+        }
+        rebalanceResCount.incrementAndGet();
+        if (rebalanceResCount.get() >= AnyDoor.onlineDstores.size()) {
+            lastTriggerTime = now;
+            final Lock writeLock = AnyDoor.rebalanceLock.writeLock();
+            if (writeLock.tryLock()) {
+                try {
+                    AnyDoor.rebalanceManager.startRebalance();
+                } finally {
+                    writeLock.unlock();
+                }
+            }
+        }
+    }
+
+    public void timer() {
+        Executors.newSingleThreadScheduledExecutor().scheduleAtFixedRate(this::prepareRebalance,
+                AnyDoor.rebalanced_period * 3L,
+                AnyDoor.rebalanced_period,
+                TimeUnit.MILLISECONDS);
+    }
+
+
+    public void prepareRebalance() {
         if (AnyDoor.onlineDstores.size() < AnyDoor.replicate) {
             Log.WARN.log("not enough dstore to rebalance");
-            return false;
+            return;
         }
         final List<DstoreHandler> dstoreList = AnyDoor.onlineDstores.values().stream().toList();
+        lastTriggerTime = LocalDateTime.now();
 
         // request all dstore to list files
         for (DstoreHandler dstoreHandler : dstoreList) {
             BlockingQueue<Map.Entry<Peer.InMessageType, String>> out = dstoreHandler.getInQueue();
             try {
-                out.put(new AbstractMap.SimpleImmutableEntry<>(Peer.InMessageType.REQ, Protocol.LIST_TOKEN));
+                out.put(new AbstractMap.SimpleImmutableEntry<>(Peer.InMessageType.EVENT, Protocol.LIST_TOKEN));
             } catch (InterruptedException e) {
                 Log.ERROR.log("Error while sending list request");
-                return false;
+                return;
             }
         }
+    }
 
+    public boolean startRebalance() {
+        final long now = System.currentTimeMillis();
+        AnyDoor.fileManager.listFiles().stream()
+                .filter(f -> f.expired(now) && !f.visible())
+                .forEach(f -> {
+                    if (f.getLock().tryLock()) {
+                        try {
+                            AnyDoor.fileManager.remove(f.getFileName());
+                        } finally {
+                            f.getLock().unlock();
+                        }
+                    }
+                });
+
+        final List<DstoreHandler> dstoreList = AnyDoor.onlineDstores.values().stream().toList();
         final List<FileHandler> allFiles = AnyDoor.fileManager.listFiles();
         final Map<String, List<DstoreHandler>> fileDstoreMap = allFiles.stream().collect(Collectors.toMap(FileHandler::getFileName, FileHandler::getOnDstores));
 
@@ -790,47 +860,46 @@ class RebalanceManager {
         final Map<DstoreHandler, Set<String>> dstoreRemoveMap = new HashMap<>();
         final Map<DstoreHandler, Set<String>> dstoreAddMap = new HashMap<>();
 
-//        // check each file
-//        for (Map.Entry<String, List<DstoreHandler>> entry : fileDstoreMap.entrySet()) {
-//            String file = entry.getKey();
-//            List<DstoreHandler> holders = entry.getValue();
-//
-//            final Optional<FileHandler> _file = AnyDoor.fileManager.fetch(file);
-//            if (_file.isEmpty()) {
-//                continue;
-//            }
-//            FileHandler fileHandler = _file.get();
-//            if (fileHandler.getStatus().intValue() == 2) {
-//                fileHandler.getOnDstores().forEach(d -> dstoreRemoveMap.computeIfAbsent(d, data -> new HashSet<>()).add(file));
-//                continue;
-//            }
-//
-//            if (holders.size() < AnyDoor.replicate) {
-//                // file needs more replicas
-//                final List<DstoreHandler> underloaded = dstoreFileMap.entrySet().stream()
-//                        .filter(e -> !holders.contains(e.getKey()))
-//                        .filter(e -> e.getValue().size() < upperBound)
-//                        .limit(AnyDoor.replicate - holders.size())
-//                        .map(Map.Entry::getKey)
-//                        .collect(Collectors.toList());
-//
-//                if (holders.size() + underloaded.size() <= AnyDoor.replicate) {
-//                    dstoreList.stream()
-//                            .filter(d -> !holders.contains(d) && !underloaded.contains(d))
-//                            .limit(AnyDoor.replicate - holders.size() - underloaded.size())
-//                            .forEach(underloaded::add);
-//                }
-//                underloaded.forEach(d -> dstoreAddMap.computeIfAbsent(d, data -> new HashSet<>()).add(file));
-//            } else if (holders.size() > AnyDoor.replicate) {
-//                // File has too many replicas
-//                holders.stream()
-//                        .map(h -> Map.entry(h, dstoreFileMap.getOrDefault(h, Collections.emptyList())))
-//                        .filter(e -> e.getValue().size() > lowerBound)
-//                        .map(Map.Entry::getKey)
-//                        .limit(holders.size() - AnyDoor.replicate)
-//                        .forEach(d -> dstoreRemoveMap.computeIfAbsent(d, data -> new HashSet<>()).add(file));
-//            }
-//        }
+        for (Map.Entry<String, List<DstoreHandler>> entry : fileDstoreMap.entrySet()) {
+            String file = entry.getKey();
+            List<DstoreHandler> haveThisFileDstores = entry.getValue();
+
+            final Optional<FileHandler> _file = AnyDoor.fileManager.fetch(file);
+            if (_file.isEmpty()) {
+                continue;
+            }
+            FileHandler fileHandler = _file.get();
+            if (fileHandler.getStatus().intValue() == 2) {
+                fileHandler.getOnDstores().forEach(d -> dstoreRemoveMap.computeIfAbsent(d, data -> new HashSet<>()).add(file));
+                continue;
+            }
+
+            if (haveThisFileDstores.size() < AnyDoor.replicate) {
+                // increase replica when file has too few replicas
+                final List<DstoreHandler> underloaded = dstoreFileMap.entrySet().stream()
+                        .filter(e -> !haveThisFileDstores.contains(e.getKey()))
+                        .filter(e -> e.getValue().size() < upperBound)
+                        .limit(AnyDoor.replicate - haveThisFileDstores.size())
+                        .map(Map.Entry::getKey)
+                        .collect(Collectors.toList());
+
+                if (haveThisFileDstores.size() + underloaded.size() <= AnyDoor.replicate) {
+                    dstoreList.stream()
+                            .filter(d -> !haveThisFileDstores.contains(d) && !underloaded.contains(d))
+                            .limit(AnyDoor.replicate - haveThisFileDstores.size() - underloaded.size())
+                            .forEach(underloaded::add);
+                }
+                underloaded.forEach(d -> dstoreAddMap.computeIfAbsent(d, data -> new HashSet<>()).add(file));
+            } else if (haveThisFileDstores.size() > AnyDoor.replicate) {
+                // remove redundant replicas
+                haveThisFileDstores.stream()
+                        .map(h -> Map.entry(h, dstoreFileMap.getOrDefault(h, Collections.emptyList())))
+                        .filter(e -> e.getValue().size() > lowerBound)
+                        .map(Map.Entry::getKey)
+                        .limit(haveThisFileDstores.size() - AnyDoor.replicate)
+                        .forEach(d -> dstoreRemoveMap.computeIfAbsent(d, data -> new HashSet<>()).add(file));
+            }
+        }
 
         // calc expected load:  Dstore -> file count
         Map<DstoreHandler, Integer> loadMap = new HashMap<>();
@@ -861,18 +930,20 @@ class RebalanceManager {
             potentialFiles.removeAll(dstoreRemoveMap.getOrDefault(highLoadDstore, Collections.emptySet()));
 
             for (String file : potentialFiles) {
-                if (loadMap.get(highLoadDstore) > upperBound) {
-                    for (DstoreHandler lowLoadDstore : lowLoadDstores) {
-                        if (loadMap.get(lowLoadDstore) < lowerBound) {
-                            dstoreAddMap.computeIfAbsent(lowLoadDstore, k -> new HashSet<>()).add(file);
-                            dstoreRemoveMap.computeIfAbsent(highLoadDstore, k -> new HashSet<>()).add(file);
-
-                            // update load
-                            loadMap.put(highLoadDstore, loadMap.get(highLoadDstore) - 1);
-                            loadMap.put(lowLoadDstore, loadMap.get(lowLoadDstore) + 1);
-                            break;
-                        }
+                if (loadMap.get(highLoadDstore) <= upperBound) {
+                    continue;
+                }
+                for (DstoreHandler lowLoadDstore : lowLoadDstores) {
+                    if (loadMap.get(lowLoadDstore) >= lowerBound) {
+                        continue;
                     }
+                    dstoreAddMap.computeIfAbsent(lowLoadDstore, k -> new HashSet<>()).add(file);
+                    dstoreRemoveMap.computeIfAbsent(highLoadDstore, k -> new HashSet<>()).add(file);
+
+                    // update load
+                    loadMap.put(highLoadDstore, loadMap.get(highLoadDstore) - 1);
+                    loadMap.put(lowLoadDstore, loadMap.get(lowLoadDstore) + 1);
+                    break;
                 }
             }
         }
@@ -880,24 +951,26 @@ class RebalanceManager {
         // execute removals and additions
         final Set<String> addFiles = dstoreAddMap.values().stream().flatMap(Collection::stream).collect(Collectors.toSet());
         for (DstoreHandler dstore : dstoreList) {
-            final List<String> canSendToOthers = dstore.fileList().stream()
+            final Set<String> toBrother = dstoreFileMap.getOrDefault(dstore, List.of())
+                    .stream()
+                    .map(FileHandler::getFileName)
                     .filter(addFiles::contains)
-                    .toList();
+                    .collect(Collectors.toSet());
             final StringBuilder sendFileCmd = new StringBuilder();
-            for (String file : canSendToOthers) {
+            for (String file : toBrother) {
                 List<DstoreHandler> peersDstore = dstoreAddMap.entrySet().stream().filter(e -> e.getValue().contains(file)).map(Map.Entry::getKey).toList();
                 if (peersDstore.isEmpty()) {
                     continue;
                 }
                 sendFileCmd.append(" ").append(file).append(" ").append(peersDstore.size());
-                peersDstore.forEach(peer -> sendFileCmd.append(" ").append(peer.port()));
+                peersDstore.forEach(peer -> sendFileCmd.append(" ").append(peer.getPort()));
             }
 
             Set<String> removeFiles = dstoreRemoveMap.getOrDefault(dstore, Collections.emptySet());
 
             StringBuilder rebalanceRequest = new StringBuilder();
-            rebalanceRequest.append(Protocol.REBALANCE_TOKEN).append(" ").append(canSendToOthers.size());
-            if (!canSendToOthers.isEmpty()) {
+            rebalanceRequest.append(Protocol.REBALANCE_TOKEN).append(" ").append(toBrother.size());
+            if (!toBrother.isEmpty()) {
                 rebalanceRequest.append(sendFileCmd);
             }
             rebalanceRequest.append(" ").append(removeFiles.size());
@@ -905,10 +978,18 @@ class RebalanceManager {
                 rebalanceRequest.append(" ").append(String.join(" ", removeFiles));
             }
 
+            dstore.getInQueue().add(new AbstractMap.SimpleImmutableEntry<>(Peer.InMessageType.EVENT, rebalanceRequest.toString()));
+            for (String f : toBrother) {
+                final Optional<FileHandler> _file = AnyDoor.fileManager.fetch(f);
+                if (_file.isEmpty()) {
+                    continue;
+                }
+                FileHandler file = _file.get();
+                List<DstoreHandler> peersDstore = dstoreAddMap.entrySet().stream().filter(e -> e.getValue().contains(file.getFileName())).map(Map.Entry::getKey).toList();
 
-            dstore.out().println(rebalanceRequest);
-            dstore.fileList().removeAll(removeFiles);
-            dstore.fileList().addAll(canSendToOthers);
+                file.getOnDstores().remove(dstore);
+                file.getOnDstores().addAll(peersDstore);
+            }
         }
         return false;
     }
