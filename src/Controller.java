@@ -1,4 +1,5 @@
 import java.io.*;
+import java.net.ServerSocket;
 import java.net.Socket;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -11,32 +12,47 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.function.Function;
 import java.util.stream.Collectors;
 
 public class Controller {
 
+    public static void main(String[] args) throws IOException {
+        AnyDoor.port = Integer.parseInt(args[0]);
+        AnyDoor.replicate = Integer.parseInt(args[1]);
+        AnyDoor.timeout = Long.parseLong(args[2]);
+        AnyDoor.rebalanced_period = Integer.parseInt(args[3]);
+
+        ServerSocket serverSocket = new ServerSocket(AnyDoor.port);
+        while (true) {
+            Socket clientSocket = serverSocket.accept();
+            Log.INFO.log("Accepted connection from %s", clientSocket.getInetAddress());
+            Peer peer = new Peer(clientSocket);
+            peer.run();
+        }
+
+
+    }
 
 }
 
 class AnyDoor {
 
+    public static int port;
+
+    public static int replicate;
+
+    public static int rebalanced_period;
+
     public static Log logLevel = Log.INFO;
 
     public static long timeout = 1000;
 
-    public static final Map<Integer, DstorePeer> onlineDstores = new ConcurrentHashMap<>();
+    public static final Map<Integer, DstoreHandler> onlineDstores = new ConcurrentHashMap<>();
 
-    public static final List<ClientPeer> onlineClients = new CopyOnWriteArrayList<>();
+    public static final List<ClientHandler> onlineClients = new CopyOnWriteArrayList<>();
 
-    public static final AtomicInteger replicate = new AtomicInteger(0);
 
     public static final FileManager fileManager = new FileManager();
-
-}
-
-
-class EventManager {
 
 }
 
@@ -75,7 +91,7 @@ class FileManager {
     public void updateFromDstore(List<String> fileLists, int dstorePort) {
         long now = System.currentTimeMillis();
 
-        DstorePeer dstorePeer = AnyDoor.onlineDstores.get(dstorePort);
+        DstoreHandler dstorePeer = AnyDoor.onlineDstores.get(dstorePort);
         Set<String> onDstoreFiles = fileMap.values().stream().filter(f -> f.getOnDstores().contains(dstorePeer)).map(FileHandler::getFileName).collect(Collectors.toSet());
 
         Set<String> willRemove = new HashSet<>(onDstoreFiles);
@@ -91,27 +107,60 @@ class FileManager {
 
 class Peer {
 
-    final Socket socket;
+    private final Socket socket;
 
     protected final BufferedReader in;
 
     protected final PrintWriter out;
 
-    public final BlockingQueue<Map.Entry<InMessageType, String>> inQueue = new LinkedBlockingQueue<>();
-    protected final BlockingQueue<Map.Entry<OutMessageType, String>> outQueue = new LinkedBlockingQueue<>();
+    protected final InputStream inputStream ;
+
+    protected final OutputStream outputStream ;
+
+    /**
+     * 0 dstore; 1 client
+     */
+    private Integer type;
+
+    private Handler handler;
 
     public Peer(Socket socket) throws IOException {
         this.socket = socket;
-        this.in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-        this.out = new PrintWriter(new OutputStreamWriter(socket.getOutputStream()), true);
+        this.inputStream = socket.getInputStream();
+        this.outputStream = socket.getOutputStream();
+        this.in = new BufferedReader(new InputStreamReader(inputStream));
+        this.out = new PrintWriter(new OutputStreamWriter(outputStream), true);
+    }
+
+    public void run() {
+        Thread receiveThread = new Thread(this::receiveMessage);
+        receiveThread.start();
+
     }
 
     public void receiveMessage() {
-        try {
-            String message = in.readLine();
-            inQueue.put(new AbstractMap.SimpleImmutableEntry<>(InMessageType.REQ, message));
-        } catch (IOException | InterruptedException e) {
-            Log.ERROR.log("Error while reading message from socket");
+        while (true) {
+            try {
+                String message = in.readLine();
+                if (type == null) {
+                    if (message.startsWith(Protocol.JOIN_TOKEN)) {
+                        type = 0;
+                        int dstorePort = Integer.parseInt(message.split(" ")[1]);
+                        handler = new DstoreHandler(new LinkedBlockingQueue<>(), new LinkedBlockingQueue<>(), dstorePort);
+                        continue;
+                    } else {
+                        type = 1;
+                        handler = new ClientHandler(new LinkedBlockingQueue<>(), new LinkedBlockingQueue<>());
+                    }
+                }
+                // dispatch message
+                new Thread(handler).start();
+                // forward message to handler
+                handler.getInQueue().put(new AbstractMap.SimpleImmutableEntry<>(InMessageType.REQ, message));
+            } catch (IOException | InterruptedException e) {
+                Log.ERROR.log("Error while reading message from socket");
+                break;
+            }
         }
     }
 
@@ -132,65 +181,11 @@ class Peer {
         BROADCAST,
         ;
 
-
     }
 }
 
-class UnknownPeer extends Peer {
 
-    public UnknownPeer(Socket socket) throws IOException {
-        super(socket);
-    }
-
-    @Override
-    public void receiveMessage() {
-        try {
-            String message = in.readLine();
-            if (message == null) {
-                return;
-            }
-            if (message.startsWith(Protocol.JOIN_TOKEN)) {
-                final int clientPort = Integer.parseInt(message.split(" ")[1]);
-                Log.INFO.log("Client %s connected", clientPort);
-                // evolute to Dstore
-                DstorePeer dstorePeer = DstorePeer.from(this, clientPort, message);
-
-                if (AnyDoor.onlineDstores.size() >= AnyDoor.replicate.intValue()) {
-                    // TODO trigger rebalance
-                }
-            }
-        } catch (IOException e) {
-            Log.ERROR.log("Error while reading message from socket");
-        } catch (InterruptedException e) {
-            throw new RuntimeException(e);
-        }
-
-    }
-}
-
-class DstorePeer extends Peer {
-
-    private final Integer port;
-
-    public DstorePeer(Socket socket, int port) throws IOException {
-        super(socket);
-        this.port = port;
-        Thread handler = new Thread(new DstoreHandler(inQueue, outQueue, port));
-        handler.start();
-    }
-
-    public Integer getPort() {
-        return port;
-    }
-
-    public static DstorePeer from(UnknownPeer peer, int port, String firstMessage) throws IOException, InterruptedException {
-        DstorePeer dstorePeer = new DstorePeer(peer.socket, port);
-        dstorePeer.inQueue.put(new AbstractMap.SimpleImmutableEntry<>(InMessageType.REQ, firstMessage));
-        return dstorePeer;
-    }
-}
-
-class DstoreHandler implements Runnable, Exchangeable {
+class DstoreHandler implements Handler {
 
     private final Integer port;
 
@@ -210,6 +205,14 @@ class DstoreHandler implements Runnable, Exchangeable {
         while (true) {
             try {
                 Map.Entry<Peer.InMessageType, String> res = inQueue.take();
+                switch (res.getKey()) {
+                    case REQ:
+                        dispatchReq(res.getValue());
+                        break;
+                    case EVENT:
+                        dispatchEvent(res.getValue());
+                        break;
+                }
                 Log.INFO.log("Received message: %s", res);
             } catch (InterruptedException e) {
                 Log.ERROR.log("Error while taking message from inQueue");
@@ -249,6 +252,11 @@ class DstoreHandler implements Runnable, Exchangeable {
         }
     }
 
+    @Override
+    public BlockingQueue<Map.Entry<Peer.InMessageType, String>> getInQueue() {
+        return inQueue;
+    }
+
     private void onList(List<String> fileLists) {
         AnyDoor.fileManager.updateFromDstore(fileLists, port);
         // TODO notify controller
@@ -256,7 +264,7 @@ class DstoreHandler implements Runnable, Exchangeable {
 
     private void onStoreAck(String filename) {
         Optional<FileHandler> _file = AnyDoor.fileManager.fetch(filename);
-        DstorePeer dstorePeer = AnyDoor.onlineDstores.get(port);
+        DstoreHandler dstorePeer = AnyDoor.onlineDstores.get(port);
         if (_file.isEmpty() || dstorePeer == null) {
             Log.ERROR.log("File or Dstore not found: %s %s", filename, port);
             return;
@@ -268,7 +276,7 @@ class DstoreHandler implements Runnable, Exchangeable {
                     try {
                         AnyDoor.onlineClients.forEach(client -> {
                             try {
-                                client.inQueue.put(new AbstractMap.SimpleImmutableEntry<>(
+                                client.getInQueue().put(new AbstractMap.SimpleImmutableEntry<>(
                                         Peer.InMessageType.EVENT,
                                         String.format("%s %s", Protocol.STORE_COMPLETE_TOKEN, filename)));
                             } catch (InterruptedException e) {
@@ -287,7 +295,7 @@ class DstoreHandler implements Runnable, Exchangeable {
 
     private void onRemoveAck(String filename) {
         Optional<FileHandler> _file = AnyDoor.fileManager.fetch(filename);
-        DstorePeer dstorePeer = AnyDoor.onlineDstores.get(port);
+        DstoreHandler dstorePeer = AnyDoor.onlineDstores.get(port);
         if (_file.isEmpty() || dstorePeer == null) {
             Log.ERROR.log("File or Dstore not found: %s %s", filename, port);
             return;
@@ -299,7 +307,7 @@ class DstoreHandler implements Runnable, Exchangeable {
                     try {
                         AnyDoor.onlineClients.forEach(client -> {
                             try {
-                                client.inQueue.put(new AbstractMap.SimpleImmutableEntry<>(
+                                client.getInQueue().put(new AbstractMap.SimpleImmutableEntry<>(
                                         Peer.InMessageType.EVENT,
                                         String.format("%s %s", Protocol.REMOVE_COMPLETE_TOKEN, filename)));
                             } catch (InterruptedException e) {
@@ -320,24 +328,18 @@ class DstoreHandler implements Runnable, Exchangeable {
     public BlockingQueue<Map.Entry<Peer.OutMessageType, String>> getOutQueue() {
         return outQueue;
     }
-}
 
-
-class ClientPeer extends Peer {
-
-    public ClientPeer(Socket socket) throws IOException {
-        super(socket);
-        Thread handler = new Thread(new ClientHandler(inQueue, outQueue));
-        handler.start();
+    public Integer getPort() {
+        return port;
     }
 }
 
-class ClientHandler implements Runnable, Exchangeable {
+class ClientHandler implements  Handler {
 
     private final BlockingQueue<Map.Entry<Peer.InMessageType, String>> inQueue;
     private final BlockingQueue<Map.Entry<Peer.OutMessageType, String>> outQueue;
 
-    private final Map<FileHandler, Set<DstorePeer>> latestLoadDstores = new HashMap<>();
+    private final Map<FileHandler, Set<DstoreHandler>> latestLoadDstores = new HashMap<>();
 
     private AtomicReference<String> waitStoreFile = new AtomicReference<>();
 
@@ -392,7 +394,7 @@ class ClientHandler implements Runnable, Exchangeable {
     }
 
     private void onClientStore(String filename, long fileSize) throws InterruptedException {
-        if (AnyDoor.onlineDstores.size() < AnyDoor.replicate.intValue()) {
+        if (AnyDoor.onlineDstores.size() < AnyDoor.replicate) {
             Log.ERROR.log("No Dstores available");
             res(Protocol.ERROR_NOT_ENOUGH_DSTORES_TOKEN);
             return;
@@ -411,7 +413,7 @@ class ClientHandler implements Runnable, Exchangeable {
         FileHandler file = _file.get();
         if (file.getLock().tryLock()) {
             try {
-                file.getWaitingDstores().addAll(AnyDoor.onlineDstores.values().stream().limit(AnyDoor.replicate.intValue()).toList());
+                file.getWaitingDstores().addAll(AnyDoor.onlineDstores.values().stream().limit(AnyDoor.replicate).toList());
                 waitStoreFile.set(filename);
             } finally {
                 file.getLock().unlock();
@@ -420,7 +422,7 @@ class ClientHandler implements Runnable, Exchangeable {
     }
 
     private void onClientLoad(String fileName) throws InterruptedException {
-        if (AnyDoor.onlineDstores.size() < AnyDoor.replicate.intValue()) {
+        if (AnyDoor.onlineDstores.size() < AnyDoor.replicate) {
             Log.ERROR.log("No Dstores available");
             res(Protocol.ERROR_NOT_ENOUGH_DSTORES_TOKEN);
             return;
@@ -431,7 +433,7 @@ class ClientHandler implements Runnable, Exchangeable {
             res(Protocol.ERROR_FILE_DOES_NOT_EXIST_TOKEN);
         }
         FileHandler file = _file.get();
-        Optional<DstorePeer> _dstorePeer = file.getOnDstores().stream()
+        Optional<DstoreHandler> _dstorePeer = file.getOnDstores().stream()
                 .filter(dstore -> !latestLoadDstores.get(file).contains(dstore))
                 .findAny();
         if (_dstorePeer.isEmpty()) {
@@ -443,7 +445,7 @@ class ClientHandler implements Runnable, Exchangeable {
     }
 
     private void onClientRemove(String filename) throws InterruptedException {
-        if (AnyDoor.onlineDstores.size() < AnyDoor.replicate.intValue()) {
+        if (AnyDoor.onlineDstores.size() < AnyDoor.replicate) {
             Log.ERROR.log("No Dstores available");
             res(Protocol.ERROR_NOT_ENOUGH_DSTORES_TOKEN);
             return;
@@ -461,7 +463,7 @@ class ClientHandler implements Runnable, Exchangeable {
                 try {
                     file.getOnDstores().forEach(dstore -> {
                         try {
-                            dstore.inQueue.put(new AbstractMap.SimpleImmutableEntry<>(
+                            dstore.getInQueue().put(new AbstractMap.SimpleImmutableEntry<>(
                                     Peer.InMessageType.EVENT,
                                     String.format("%s %s", Protocol.REMOVE_TOKEN, filename)));
                         } catch (InterruptedException e) {
@@ -478,7 +480,7 @@ class ClientHandler implements Runnable, Exchangeable {
     }
 
     private void onList() throws InterruptedException {
-        if (AnyDoor.onlineDstores.size() < AnyDoor.replicate.intValue()) {
+        if (AnyDoor.onlineDstores.size() < AnyDoor.replicate) {
             Log.ERROR.log("No Dstores available");
             res(Protocol.ERROR_NOT_ENOUGH_DSTORES_TOKEN);
             return;
@@ -491,7 +493,7 @@ class ClientHandler implements Runnable, Exchangeable {
         }
     }
 
-    private void dispatchEvent(String message) {
+    public void dispatchEvent(String message) {
         final String[] tokens = message.split(" ");
         final String opt = tokens[0];
         switch (opt) {
@@ -501,6 +503,11 @@ class ClientHandler implements Runnable, Exchangeable {
             default:
                 Log.ERROR.log("Unknown message: %s", message);
         }
+    }
+
+    @Override
+    public BlockingQueue<Map.Entry<Peer.InMessageType, String>> getInQueue() {
+        return inQueue;
     }
 
     private void onStoreComplete(String filename) {
@@ -562,9 +569,9 @@ class FileHandler {
 
     private final long addedTime = System.currentTimeMillis();
 
-    private final List<DstorePeer> onDstores = new CopyOnWriteArrayList<>();
+    private final List<DstoreHandler> onDstores = new CopyOnWriteArrayList<>();
 
-    private final List<DstorePeer> waitingDstores = new CopyOnWriteArrayList<>();
+    private final List<DstoreHandler> waitingDstores = new CopyOnWriteArrayList<>();
 
     /**
      * mutex lock
@@ -589,7 +596,7 @@ class FileHandler {
         return lock;
     }
 
-    public List<DstorePeer> getOnDstores() {
+    public List<DstoreHandler> getOnDstores() {
         return onDstores;
     }
 
@@ -597,7 +604,7 @@ class FileHandler {
         return status;
     }
 
-    public List<DstorePeer> getWaitingDstores() {
+    public List<DstoreHandler> getWaitingDstores() {
         return waitingDstores;
     }
 
@@ -605,7 +612,7 @@ class FileHandler {
         return fileSize;
     }
 
-    public boolean ackStore(DstorePeer dstore) {
+    public boolean ackStore(DstoreHandler dstore) {
         waitingDstores.remove(dstore);
         onDstores.add(dstore);
         if (waitingDstores.isEmpty()) {
@@ -615,7 +622,7 @@ class FileHandler {
         return false;
     }
 
-    public boolean ackRemove(DstorePeer dstore) {
+    public boolean ackRemove(DstoreHandler dstore) {
         waitingDstores.remove(dstore);
         onDstores.remove(dstore);
         if (onDstores.isEmpty()) {
@@ -633,13 +640,17 @@ class FileHandler {
         return status.get() == 1;
     }
 
-    public void removeDstore(DstorePeer dstorePeer) {
+    public void removeDstore(DstoreHandler dstorePeer) {
         onDstores.remove(dstorePeer);
         waitingDstores.remove(dstorePeer);
     }
 }
 
-interface Exchangeable {
+interface Handler extends Runnable {
+
+    void dispatchReq(String message) throws InterruptedException;
+
+    void dispatchEvent(String message);
 
     default void res(String message) throws InterruptedException {
         getOutQueue().put(new AbstractMap.SimpleImmutableEntry<>(Peer.OutMessageType.RES, message));
@@ -648,6 +659,8 @@ interface Exchangeable {
     default void broadcast(String message) throws InterruptedException {
         getOutQueue().put(new AbstractMap.SimpleImmutableEntry<>(Peer.OutMessageType.BROADCAST, message));
     }
+
+    BlockingQueue<Map.Entry<Peer.InMessageType, String>> getInQueue();
 
     BlockingQueue<Map.Entry<Peer.OutMessageType, String>> getOutQueue();
 
