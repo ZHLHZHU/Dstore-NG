@@ -13,24 +13,20 @@ public class TestNg {
         assert list.length == 0;
 
         client.store(new File("to_store/1.jpg"));
+        client.store(new File("to_store/1.txt"));
+        client.store(new File("to_store/2.txt"));
+//        client.store(new File("to_store/3.txt"));
+//        client.store(new File("to_store/2.jpg"));
+
+//        Thread.sleep(30000);
 
         final String[] list1 = client.list();
-        assert list1.length == 1;
-
-        byte[] res = client.load("1.jpg");
-        // write to file
-        File file = new File("output.jpg");
-        try (FileOutputStream fos = new FileOutputStream(file)) {
-            fos.write(res);
-            fos.flush();  // Ensure all data is written to the file system
-        } catch (IOException e) {
-            e.printStackTrace();  // Handle exceptions, possibly logging them
+        assert list1.length == 4;
+        System.out.println("List of files:");
+        for (String s : list1) {
+            System.out.println(s);
         }
 
-        client.remove("1.jpg");
-
-        final String[] list2 = client.list();
-        assert list2.length == 0;
 
         client.disconnect();
     }

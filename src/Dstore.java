@@ -1,4 +1,5 @@
 import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
@@ -153,6 +154,7 @@ class ControllerHandler implements Runnable {
             Arrays.stream(tokens).skip(startIndex)
                     .limit(destNum)
                     .forEach(to -> filesToSend.computeIfAbsent(file, k -> new ArrayList<>()).add(to));
+            startIndex += destNum;
         }
 
         int removeNum = Integer.parseInt(tokens[startIndex++]);
@@ -173,18 +175,25 @@ class ControllerHandler implements Runnable {
             for (String dest : entry.getValue()) {
                 final Thread thread = new Thread(() -> {
                     try (var socket = new Socket("localhost", Integer.parseInt(dest))) {
+                        Log1.INFO.log("[Dstore] REBALANCE sending file: %s to %s", file, dest);
+
                         PrintWriter sender = new PrintWriter(socket.getOutputStream(), true);
                         sender.println(Protocol.REBALANCE_STORE_TOKEN + " " + file + " " + _fileSize.get());
+
                         BufferedReader rec = new BufferedReader(new InputStreamReader(socket.getInputStream()));
                         final String res = rec.readLine();
                         if (res == null || !res.equals(Protocol.ACK_TOKEN)) {
                             return;
                         }
-                        try (var reader = new BufferedReader(new StringReader(content))) {
-                            String line;
-                            while ((line = reader.readLine()) != null) {
-                                sender.println(line);
+
+                        try (var outputStream = socket.getOutputStream();
+                             var fileInputStream = new ByteArrayInputStream(content.getBytes())) {
+                            byte[] buffer = new byte[4096];
+                            int bytesRead;
+                            while ((bytesRead = fileInputStream.read(buffer)) != -1) {
+                                outputStream.write(buffer, 0, bytesRead);
                             }
+                            outputStream.flush();
                         }
                     } catch (Exception e) {
                         Log1.ERROR.log("[Dstore] failed to transfer file: %s", e.getMessage());

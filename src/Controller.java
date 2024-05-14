@@ -326,7 +326,7 @@ class DstoreHandler implements Handler {
                 break;
             case Protocol.REBALANCE_COMPLETE_TOKEN:
             case Protocol.ERROR_FILE_DOES_NOT_EXIST_TOKEN:
-                Log.INFO.log("Received message: %s", message);
+                break;
             default:
                 Log.ERROR.log("Unknown message: %s", message);
         }
@@ -358,7 +358,7 @@ class DstoreHandler implements Handler {
 
     private void onList(List<String> fileLists) {
         AnyDoor.fileManager.updateFromDstore(fileLists, port);
-        // TODO notify controller
+        RebalanceManager.addRebalanceResCount(LocalDateTime.now());
     }
 
     private void listenRebalanceList() throws InterruptedException {
@@ -617,7 +617,6 @@ class ClientHandler implements Handler {
         } else {
             res(Protocol.LIST_TOKEN + " " + String.join(" ", fileList));
         }
-        AnyDoor.rebalanceManager.addRebalanceResCount(LocalDateTime.now());
     }
 
     public void dispatchEvent(String message) throws InterruptedException {
@@ -784,7 +783,7 @@ class RebalanceManager {
         }
         rebalanceResCount.incrementAndGet();
         if (rebalanceResCount.get() >= AnyDoor.onlineDstores.size()) {
-            lastTriggerTime = now;
+            lastTriggerTime = null;
             final Lock writeLock = AnyDoor.rebalanceLock.writeLock();
             if (writeLock.tryLock()) {
                 try {
@@ -798,9 +797,9 @@ class RebalanceManager {
 
     public void timer() {
         Executors.newSingleThreadScheduledExecutor().scheduleAtFixedRate(this::prepareRebalance,
-                AnyDoor.rebalanced_period * 3L,
+                AnyDoor.rebalanced_period * 2L,
                 AnyDoor.rebalanced_period,
-                TimeUnit.MILLISECONDS);
+                TimeUnit.SECONDS);
     }
 
 
@@ -937,6 +936,9 @@ class RebalanceManager {
                     if (loadMap.get(lowLoadDstore) >= lowerBound) {
                         continue;
                     }
+                    if (dstoreAddMap.getOrDefault(lowLoadDstore, Collections.emptySet()).contains(file)) {
+                        continue;
+                    }
                     dstoreAddMap.computeIfAbsent(lowLoadDstore, k -> new HashSet<>()).add(file);
                     dstoreRemoveMap.computeIfAbsent(highLoadDstore, k -> new HashSet<>()).add(file);
 
@@ -956,6 +958,7 @@ class RebalanceManager {
                     .map(FileHandler::getFileName)
                     .filter(addFiles::contains)
                     .collect(Collectors.toSet());
+            addFiles.removeAll(toBrother);
             final StringBuilder sendFileCmd = new StringBuilder();
             for (String file : toBrother) {
                 List<DstoreHandler> peersDstore = dstoreAddMap.entrySet().stream().filter(e -> e.getValue().contains(file)).map(Map.Entry::getKey).toList();
