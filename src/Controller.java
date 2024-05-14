@@ -27,7 +27,7 @@ public class Controller {
 
         while (true) {
             Socket clientSocket = serverSocket.accept();
-            Log.INFO.log("Accepted connection from %s", clientSocket.getInetAddress());
+            Log.INFO.log("Accepted connection from %s:%d", clientSocket.getInetAddress().getHostAddress(), clientSocket.getPort());
             new Thread(() -> {
                 try {
                     Peer peer = new Peer(clientSocket);
@@ -35,7 +35,7 @@ public class Controller {
                 } catch (IOException e) {
                     Log.ERROR.log("Error while creating peer");
                 }
-            });
+            }).start();
         }
     }
 
@@ -172,6 +172,7 @@ class Peer {
                 Log.INFO.log("Sent message: %s", res);
             } catch (InterruptedException e) {
                 Log.ERROR.log("Error while taking message from outQueue");
+                break;
             }
         }
     }
@@ -186,7 +187,7 @@ class Peer {
                         continue;
                     } else {
                         type = 1;
-                        handler = new ClientHandler(new LinkedBlockingQueue<>(), new LinkedBlockingQueue<>());
+                        handler = new ClientHandler(inQueue, outQueue);
                         AnyDoor.onlineClients.add((ClientHandler) handler);
                     }
                 }
@@ -202,6 +203,7 @@ class Peer {
     }
 
     private void onJoin(String message) {
+        Log.INFO.log("Dstore joined: %s", message);
         type = 0;
         int dstorePort = Integer.parseInt(message.split(" ")[1]);
         handler = new DstoreHandler(new LinkedBlockingQueue<>(), new LinkedBlockingQueue<>(), dstorePort);
@@ -261,6 +263,7 @@ class DstoreHandler implements Handler {
                 Log.INFO.log("Received message: %s", res);
             } catch (InterruptedException e) {
                 Log.ERROR.log("Error while taking message from inQueue");
+                break;
             }
         }
     }
@@ -411,6 +414,7 @@ class ClientHandler implements Handler {
                 Log.INFO.log("Received message: %s", res);
             } catch (InterruptedException e) {
                 Log.ERROR.log("Error while taking message from inQueue");
+                break;
             }
         }
     }
