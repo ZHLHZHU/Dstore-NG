@@ -23,14 +23,20 @@ public class Controller {
         AnyDoor.rebalanced_period = Integer.parseInt(args[3]);
 
         ServerSocket serverSocket = new ServerSocket(AnyDoor.port);
+        Log.INFO.log("Controller started at port %d", AnyDoor.port);
+
         while (true) {
             Socket clientSocket = serverSocket.accept();
             Log.INFO.log("Accepted connection from %s", clientSocket.getInetAddress());
-            Peer peer = new Peer(clientSocket);
-            peer.run();
+            new Thread(() -> {
+                try {
+                    Peer peer = new Peer(clientSocket);
+                    peer.run();
+                } catch (IOException e) {
+                    Log.ERROR.log("Error while creating peer");
+                }
+            });
         }
-
-
     }
 
 }
@@ -113,9 +119,9 @@ class Peer {
 
     protected final PrintWriter out;
 
-    protected final InputStream inputStream ;
+    protected final InputStream inputStream;
 
-    protected final OutputStream outputStream ;
+    protected final OutputStream outputStream;
 
     /**
      * 0 dstore; 1 client
@@ -133,27 +139,58 @@ class Peer {
     }
 
     public void run() {
-        Thread receiveThread = new Thread(this::receiveMessage);
+        BlockingQueue<Map.Entry<Peer.InMessageType, String>> inQueue = new LinkedBlockingQueue<>();
+        BlockingQueue<Map.Entry<Peer.OutMessageType, String>> outQueue = new LinkedBlockingQueue<>();
+
+        Thread receiveThread = new Thread(() -> receiveMessage(inQueue, outQueue));
         receiveThread.start();
 
+        Thread sendThread = new Thread(() -> sendMessage(outQueue));
+        sendThread.start();
     }
 
-    public void receiveMessage() {
+    public void sendMessage(BlockingQueue<Map.Entry<Peer.OutMessageType, String>> outQueue) {
+        while (true) {
+            try {
+                Map.Entry<Peer.OutMessageType, String> res = outQueue.take();
+                switch (res.getKey()) {
+                    case RES:
+                        out.println(res.getValue());
+                        break;
+                    case BROADCAST:
+                        AnyDoor.onlineClients.forEach(client -> {
+                            try {
+                                client.getInQueue().put(new AbstractMap.SimpleImmutableEntry<>(
+                                        Peer.InMessageType.EVENT,
+                                        res.getValue()));
+                            } catch (InterruptedException e) {
+                                Log.ERROR.log("Error while broadcasting message");
+                            }
+                        });
+                        break;
+                }
+                Log.INFO.log("Sent message: %s", res);
+            } catch (InterruptedException e) {
+                Log.ERROR.log("Error while taking message from outQueue");
+            }
+        }
+    }
+
+    public void receiveMessage(BlockingQueue<Map.Entry<Peer.InMessageType, String>> inQueue, BlockingQueue<Map.Entry<Peer.OutMessageType, String>> outQueue) {
         while (true) {
             try {
                 String message = in.readLine();
                 if (type == null) {
                     if (message.startsWith(Protocol.JOIN_TOKEN)) {
-                        type = 0;
-                        int dstorePort = Integer.parseInt(message.split(" ")[1]);
-                        handler = new DstoreHandler(new LinkedBlockingQueue<>(), new LinkedBlockingQueue<>(), dstorePort);
+                        onJoin(message);
                         continue;
                     } else {
                         type = 1;
                         handler = new ClientHandler(new LinkedBlockingQueue<>(), new LinkedBlockingQueue<>());
+                        AnyDoor.onlineClients.add((ClientHandler) handler);
                     }
                 }
-                // dispatch message
+//                 dispatch message
                 new Thread(handler).start();
                 // forward message to handler
                 handler.getInQueue().put(new AbstractMap.SimpleImmutableEntry<>(InMessageType.REQ, message));
@@ -162,6 +199,14 @@ class Peer {
                 break;
             }
         }
+    }
+
+    private void onJoin(String message) {
+        type = 0;
+        int dstorePort = Integer.parseInt(message.split(" ")[1]);
+        handler = new DstoreHandler(new LinkedBlockingQueue<>(), new LinkedBlockingQueue<>(), dstorePort);
+        AnyDoor.onlineDstores.put(dstorePort, (DstoreHandler) handler);
+        // TODO rebalance on join
     }
 
     public enum InMessageType {
@@ -334,7 +379,7 @@ class DstoreHandler implements Handler {
     }
 }
 
-class ClientHandler implements  Handler {
+class ClientHandler implements Handler {
 
     private final BlockingQueue<Map.Entry<Peer.InMessageType, String>> inQueue;
     private final BlockingQueue<Map.Entry<Peer.OutMessageType, String>> outQueue;
@@ -556,7 +601,7 @@ enum Log {
         }
 
         StackTraceElement[] stackTrace = Thread.currentThread().getStackTrace();
-        final String currentCall = stackTrace.length > 3 ? stackTrace[3].toString() : "-";
+        final String currentCall = stackTrace.length > 2 ? stackTrace[2].toString() : "-";
         System.out.printf("%s [%s] %s %s\n", LocalDateTime.now().format(dateTimeFormat), this.name(), currentCall, String.format(msg, args));
     }
 }
@@ -647,10 +692,6 @@ class FileHandler {
 }
 
 interface Handler extends Runnable {
-
-    void dispatchReq(String message) throws InterruptedException;
-
-    void dispatchEvent(String message);
 
     default void res(String message) throws InterruptedException {
         getOutQueue().put(new AbstractMap.SimpleImmutableEntry<>(Peer.OutMessageType.RES, message));
