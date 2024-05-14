@@ -81,68 +81,6 @@ public class Controller {
 
 }
 
-class AnyDoor {
-
-    public static final Map<Integer, DstoreHandler> onlineDstores = new ConcurrentHashMap<>();
-    public static final List<ClientHandler> onlineClients = new CopyOnWriteArrayList<>();
-    public static final FileManager fileManager = new FileManager();
-    public static int port;
-    public static int replicate;
-    public static int rebalanced_period;
-    public static Log logLevel = Log.TRACE;
-    public static long timeout = 1000;
-
-}
-
-class FileManager {
-
-    private final Map<String, FileHandler> fileMap = new HashMap<>();
-
-
-    public boolean contains(String filename) {
-        return fileMap.containsKey(filename);
-    }
-
-    public Optional<FileHandler> startStoring(String filename, long fileSize) {
-        FileHandler old = fileMap.putIfAbsent(filename, new FileHandler(filename, fileSize));
-        if (old != null) {
-            return Optional.empty();
-        }
-        return Optional.of(fileMap.get(filename));
-    }
-
-    public Optional<FileHandler> fetch(String filename) {
-        FileHandler file = fileMap.get(filename);
-        if (file == null) {
-            return Optional.empty();
-        }
-        return Optional.of(file);
-    }
-
-    public List<String> list() {
-        return fileMap.values().stream()
-                .filter(FileHandler::visible)
-                .map(FileHandler::getFileName)
-                .toList();
-    }
-
-    public void updateFromDstore(List<String> fileLists, int dstorePort) {
-        long now = System.currentTimeMillis();
-
-        DstoreHandler dstorePeer = AnyDoor.onlineDstores.get(dstorePort);
-        Set<String> onDstoreFiles = fileMap.values().stream().filter(f -> f.getOnDstores().contains(dstorePeer)).map(FileHandler::getFileName).collect(Collectors.toSet());
-
-        Set<String> willRemove = new HashSet<>(onDstoreFiles);
-        fileLists.forEach(willRemove::remove);
-
-        Set<String> willAdd = new HashSet<>(fileLists);
-        willAdd.removeAll(onDstoreFiles);
-
-        willRemove.stream().map(fileMap::get).forEach(f -> f.removeDstore(dstorePeer));
-        willAdd.forEach(f -> fileMap.get(f).getOnDstores().add(dstorePeer));
-    }
-}
-
 class Peer {
 
     protected final BufferedReader in;
@@ -261,6 +199,69 @@ class Peer {
         BROADCAST,
         ;
 
+    }
+}
+
+
+class AnyDoor {
+
+    public static final Map<Integer, DstoreHandler> onlineDstores = new ConcurrentHashMap<>();
+    public static final List<ClientHandler> onlineClients = new CopyOnWriteArrayList<>();
+    public static final FileManager fileManager = new FileManager();
+    public static int port;
+    public static int replicate;
+    public static int rebalanced_period;
+    public static Log logLevel = Log.TRACE;
+    public static long timeout = 1000;
+
+}
+
+class FileManager {
+
+    private final Map<String, FileHandler> fileMap = new HashMap<>();
+
+
+    public boolean contains(String filename) {
+        return fileMap.containsKey(filename);
+    }
+
+    public Optional<FileHandler> startStoring(String filename, long fileSize) {
+        FileHandler old = fileMap.putIfAbsent(filename, new FileHandler(filename, fileSize));
+        if (old != null) {
+            return Optional.empty();
+        }
+        return Optional.of(fileMap.get(filename));
+    }
+
+    public Optional<FileHandler> fetch(String filename) {
+        FileHandler file = fileMap.get(filename);
+        if (file == null) {
+            return Optional.empty();
+        }
+        return Optional.of(file);
+    }
+
+    public List<String> list() {
+        return fileMap.values().stream()
+                .filter(FileHandler::visible)
+                .map(FileHandler::getFileName)
+                .toList();
+    }
+
+    public void updateFromDstore(List<String> fileLists, int dstorePort) {
+        long now = System.currentTimeMillis();
+
+        DstoreHandler dstorePeer = AnyDoor.onlineDstores.get(dstorePort);
+        Set<String> onDstoreFiles = fileMap.values().stream().filter(f -> f.getOnDstores().contains(dstorePeer)).map(FileHandler::getFileName).collect(Collectors.toSet());
+
+        Set<String> willRemove = new HashSet<>(onDstoreFiles);
+        fileLists.forEach(willRemove::remove);
+
+        Set<String> willAdd = new HashSet<>(fileLists);
+        willAdd.removeAll(onDstoreFiles);
+
+        willRemove.stream().map(fileMap::get).forEach(f -> f.removeDstore(dstorePeer));
+        willAdd.forEach(f -> fileMap.get(f).getOnDstores().add(dstorePeer));
     }
 }
 
@@ -515,16 +516,19 @@ class ClientHandler implements Handler {
         if (_file.isEmpty()) {
             Log.ERROR.log("File does not exist: %s", fileName);
             res(Protocol.ERROR_FILE_DOES_NOT_EXIST_TOKEN);
+            return;
         }
         FileHandler file = _file.get();
         Optional<DstoreHandler> _dstorePeer = file.getOnDstores().stream()
-                .filter(dstore -> !latestLoadDstores.get(file).contains(dstore))
+                .filter(dstore -> Optional.ofNullable(latestLoadDstores.get(file)).map(ds -> !ds.contains(dstore)).orElse(true))
                 .findAny();
         if (_dstorePeer.isEmpty()) {
             latestLoadDstores.clear();
             res(Protocol.ERROR_FILE_DOES_NOT_EXIST_TOKEN);
             return;
         }
+        latestLoadDstores.putIfAbsent(file, new HashSet<>());
+        latestLoadDstores.get(file).add(_dstorePeer.get());
         res(String.format("%s %s %s", Protocol.LOAD_FROM_TOKEN, _dstorePeer.get().getPort(), file.getFileSize()));
     }
 

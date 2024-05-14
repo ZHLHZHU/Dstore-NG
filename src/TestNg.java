@@ -1,4 +1,5 @@
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 
 public class TestNg {
@@ -15,6 +16,16 @@ public class TestNg {
 
         final String[] list1 = client.list();
         assert list1.length == 1;
+
+        byte[] res = client.load("1.jpg");
+        // write to file
+        File file = new File("output.jpg");
+        try (FileOutputStream fos = new FileOutputStream(file)) {
+            fos.write(res);
+            fos.flush();  // Ensure all data is written to the file system
+        } catch (IOException e) {
+            e.printStackTrace();  // Handle exceptions, possibly logging them
+        }
 
         client.remove("1.jpg");
 
