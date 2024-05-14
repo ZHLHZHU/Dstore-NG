@@ -7,12 +7,52 @@ import java.util.*;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
+
+enum Log {
+    TRACE,
+    DEBUG,
+    INFO,
+    ERROR;
+
+    private static final DateTimeFormatter dateTimeFormat = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+    public void log(String msg, Object... args) {
+        if (this.ordinal() < AnyDoor.logLevel.ordinal()) {
+            return;
+        }
+
+        if (msg.endsWith("\n")) {
+            msg = msg.substring(0, msg.length() - 1);
+        }
+
+        StackTraceElement[] stackTrace = Thread.currentThread().getStackTrace();
+        final String currentCall = stackTrace.length > 2 ? stackTrace[2].toString() : "-";
+        System.out.printf("%s [%s] %s %s\n", LocalDateTime.now().format(dateTimeFormat), this.name(), currentCall, String.format(msg, args));
+    }
+}
+
+interface Handler extends Runnable {
+
+    default void res(String message) throws InterruptedException {
+        getOutQueue().put(new AbstractMap.SimpleImmutableEntry<>(Peer.OutMessageType.RES, message));
+    }
+
+    default void broadcast(String message) throws InterruptedException {
+        getOutQueue().put(new AbstractMap.SimpleImmutableEntry<>(Peer.OutMessageType.BROADCAST, message));
+    }
+
+    BlockingQueue<Map.Entry<Peer.InMessageType, String>> getInQueue();
+
+    BlockingQueue<Map.Entry<Peer.OutMessageType, String>> getOutQueue();
+
+}
 
 public class Controller {
 
@@ -43,22 +83,14 @@ public class Controller {
 
 class AnyDoor {
 
-    public static int port;
-
-    public static int replicate;
-
-    public static int rebalanced_period;
-
-    public static Log logLevel = Log.TRACE;
-
-    public static long timeout = 1000;
-
     public static final Map<Integer, DstoreHandler> onlineDstores = new ConcurrentHashMap<>();
-
     public static final List<ClientHandler> onlineClients = new CopyOnWriteArrayList<>();
-
-
     public static final FileManager fileManager = new FileManager();
+    public static int port;
+    public static int replicate;
+    public static int rebalanced_period;
+    public static Log logLevel = Log.TRACE;
+    public static long timeout = 1000;
 
 }
 
@@ -81,7 +113,7 @@ class FileManager {
 
     public Optional<FileHandler> fetch(String filename) {
         FileHandler file = fileMap.get(filename);
-        if (file == null || file.visible() || file.expired(System.currentTimeMillis())) {
+        if (file == null) {
             return Optional.empty();
         }
         return Optional.of(file);
@@ -113,16 +145,11 @@ class FileManager {
 
 class Peer {
 
-    private final Socket socket;
-
     protected final BufferedReader in;
-
     protected final PrintWriter out;
-
     protected final InputStream inputStream;
-
     protected final OutputStream outputStream;
-
+    private final Socket socket;
     /**
      * 0 dstore; 1 client
      */
@@ -155,6 +182,7 @@ class Peer {
                 Map.Entry<Peer.OutMessageType, String> res = outQueue.take();
                 switch (res.getKey()) {
                     case RES:
+                        Log.TRACE.log(String.format("✉\uFE0F->[%s] %s", type == 0 ? "Dstore" : "Client", res.getValue()));
                         out.println(res.getValue());
                         break;
                     case BROADCAST:
@@ -169,7 +197,7 @@ class Peer {
                         });
                         break;
                 }
-                Log.INFO.log("Sent message: %s", res);
+                Log.TRACE.log("Sent message: %s", res);
             } catch (InterruptedException e) {
                 Log.ERROR.log("Error while taking message from outQueue");
                 break;
@@ -187,7 +215,7 @@ class Peer {
                 }
                 if (type == null) {
                     if (message.startsWith(Protocol.JOIN_TOKEN)) {
-                        onJoin(message);
+                        handler = onJoin(message, inQueue, outQueue);
                         continue;
                     } else {
                         type = 1;
@@ -206,13 +234,14 @@ class Peer {
         }
     }
 
-    private void onJoin(String message) {
+    private DstoreHandler onJoin(String message, BlockingQueue<Map.Entry<InMessageType, String>> inQueue, BlockingQueue<Map.Entry<OutMessageType, String>> outQueue) {
         Log.INFO.log("Dstore joined: %s", message);
         type = 0;
         int dstorePort = Integer.parseInt(message.split(" ")[1]);
-        handler = new DstoreHandler(new LinkedBlockingQueue<>(), new LinkedBlockingQueue<>(), dstorePort);
-        AnyDoor.onlineDstores.put(dstorePort, (DstoreHandler) handler);
+        DstoreHandler newDstore = new DstoreHandler(inQueue, outQueue, dstorePort);
+        AnyDoor.onlineDstores.put(dstorePort, newDstore);
         // TODO rebalance on join
+        return newDstore;
     }
 
     public enum InMessageType {
@@ -234,7 +263,6 @@ class Peer {
 
     }
 }
-
 
 class DstoreHandler implements Handler {
 
@@ -295,10 +323,13 @@ class DstoreHandler implements Handler {
         }
     }
 
-    public void dispatchEvent(String message) {
+    public void dispatchEvent(String message) throws InterruptedException {
         final String[] tokens = message.split(" ");
         final String opt = tokens[0];
         switch (opt) {
+            case Protocol.REMOVE_TOKEN:
+                listenRemove(tokens[1]);
+                break;
             default:
                 Log.ERROR.log("Unknown message: %s", message);
         }
@@ -357,15 +388,9 @@ class DstoreHandler implements Handler {
             try {
                 if (file.ackRemove(dstorePeer)) {
                     try {
-                        AnyDoor.onlineClients.forEach(client -> {
-                            try {
-                                client.getInQueue().put(new AbstractMap.SimpleImmutableEntry<>(
-                                        Peer.InMessageType.EVENT,
-                                        String.format("%s %s", Protocol.REMOVE_COMPLETE_TOKEN, filename)));
-                            } catch (InterruptedException e) {
-                                Log.ERROR.log("Error while broadcasting remove complete message");
-                            }
-                        });
+                        file.getWaitingClient().getInQueue().put(new AbstractMap.SimpleImmutableEntry<>(
+                                Peer.InMessageType.EVENT,
+                                String.format("%s %s", Protocol.REMOVE_COMPLETE_TOKEN, filename)));
                     } catch (Exception e) {
                         Log.ERROR.log("Error while broadcasting remove complete message");
                     }
@@ -374,6 +399,11 @@ class DstoreHandler implements Handler {
                 file.getLock().unlock();
             }
         }
+    }
+
+    private void listenRemove(String filename) throws InterruptedException {
+        Log.TRACE.log("Received remove message: %s", filename);
+        res(Protocol.REMOVE_TOKEN + " " + filename);
     }
 
     @Override
@@ -449,7 +479,6 @@ class ClientHandler implements Handler {
     private void onClientStore(String filename, long fileSize) throws InterruptedException {
         Log.TRACE.log("Store request: %s %d", filename, fileSize);
         if (AnyDoor.onlineDstores.size() < AnyDoor.replicate) {
-            Log.ERROR.log("No Dstores available");
             res(Protocol.ERROR_NOT_ENOUGH_DSTORES_TOKEN);
             return;
         }
@@ -468,7 +497,7 @@ class ClientHandler implements Handler {
         FileHandler file = _file.get();
         if (file.getLock().tryLock()) {
             try {
-                file.getWaitingDstores().addAll(candidateDstore);
+                file.store(this, candidateDstore);
                 waitStoreFile.set(filename);
             } finally {
                 file.getLock().unlock();
@@ -479,7 +508,6 @@ class ClientHandler implements Handler {
 
     private void onClientLoad(String fileName) throws InterruptedException {
         if (AnyDoor.onlineDstores.size() < AnyDoor.replicate) {
-            Log.ERROR.log("No Dstores available");
             res(Protocol.ERROR_NOT_ENOUGH_DSTORES_TOKEN);
             return;
         }
@@ -502,7 +530,6 @@ class ClientHandler implements Handler {
 
     private void onClientRemove(String filename) throws InterruptedException {
         if (AnyDoor.onlineDstores.size() < AnyDoor.replicate) {
-            Log.ERROR.log("No Dstores available");
             res(Protocol.ERROR_NOT_ENOUGH_DSTORES_TOKEN);
             return;
         }
@@ -554,7 +581,10 @@ class ClientHandler implements Handler {
         final String opt = tokens[0];
         switch (opt) {
             case Protocol.STORE_COMPLETE_TOKEN:
-                onStoreComplete(tokens[1]);
+                listenStoreComplete(tokens[1]);
+                break;
+            case Protocol.REMOVE_COMPLETE_TOKEN:
+                listenRemoveComplete(tokens[1]);
                 break;
             default:
                 Log.ERROR.log("Unknown message: %s", message);
@@ -566,7 +596,7 @@ class ClientHandler implements Handler {
         return inQueue;
     }
 
-    private void onStoreComplete(String filename) {
+    private void listenStoreComplete(String filename) {
         if (waitStoreFile.get().equals(filename)) {
             waitStoreFile.set(null);
             try {
@@ -577,7 +607,7 @@ class ClientHandler implements Handler {
         }
     }
 
-    private void onRemoveComplete(String filename) {
+    private void listenRemoveComplete(String filename) {
         if (waitRemoveFile.get().equals(filename)) {
             waitRemoveFile.set(null);
             try {
@@ -594,29 +624,6 @@ class ClientHandler implements Handler {
     }
 }
 
-enum Log {
-    TRACE,
-    DEBUG,
-    INFO,
-    ERROR;
-
-    private static final DateTimeFormatter dateTimeFormat = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
-
-    public void log(String msg, Object... args) {
-        if (this.ordinal() < AnyDoor.logLevel.ordinal()) {
-            return;
-        }
-
-        if (msg.endsWith("\n")) {
-            msg = msg.substring(0, msg.length() - 1);
-        }
-
-        StackTraceElement[] stackTrace = Thread.currentThread().getStackTrace();
-        final String currentCall = stackTrace.length > 2 ? stackTrace[2].toString() : "-";
-        System.out.printf("%s [%s] %s %s\n", LocalDateTime.now().format(dateTimeFormat), this.name(), currentCall, String.format(msg, args));
-    }
-}
-
 class FileHandler {
 
     private final String fileName;
@@ -627,7 +634,9 @@ class FileHandler {
 
     private final List<DstoreHandler> onDstores = new CopyOnWriteArrayList<>();
 
-    private final List<DstoreHandler> waitingDstores = new CopyOnWriteArrayList<>();
+    private final Set<DstoreHandler> waitingDstores = new CopyOnWriteArraySet<>();
+
+    private ClientHandler waitingClient;
 
     /**
      * mutex lock
@@ -660,10 +669,6 @@ class FileHandler {
         return status;
     }
 
-    public List<DstoreHandler> getWaitingDstores() {
-        return waitingDstores;
-    }
-
     public long getFileSize() {
         return fileSize;
     }
@@ -689,6 +694,9 @@ class FileHandler {
     }
 
     public boolean expired(long now) {
+        if (this.status.intValue() == 1) {
+            return false;
+        }
         return now - addedTime > AnyDoor.timeout;
     }
 
@@ -700,20 +708,13 @@ class FileHandler {
         onDstores.remove(dstorePeer);
         waitingDstores.remove(dstorePeer);
     }
-}
 
-interface Handler extends Runnable {
-
-    default void res(String message) throws InterruptedException {
-        getOutQueue().put(new AbstractMap.SimpleImmutableEntry<>(Peer.OutMessageType.RES, message));
+    public void store(ClientHandler clientHandler, List<DstoreHandler> candidateDstore) {
+        this.waitingClient = clientHandler;
+        this.waitingDstores.addAll(candidateDstore);
     }
 
-    default void broadcast(String message) throws InterruptedException {
-        getOutQueue().put(new AbstractMap.SimpleImmutableEntry<>(Peer.OutMessageType.BROADCAST, message));
+    public ClientHandler getWaitingClient() {
+        return waitingClient;
     }
-
-    BlockingQueue<Map.Entry<Peer.InMessageType, String>> getInQueue();
-
-    BlockingQueue<Map.Entry<Peer.OutMessageType, String>> getOutQueue();
-
 }

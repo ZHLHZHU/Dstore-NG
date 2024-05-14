@@ -16,6 +16,11 @@ public class TestNg {
         final String[] list1 = client.list();
         assert list1.length == 1;
 
+        client.remove("1.jpg");
+
+        final String[] list2 = client.list();
+        assert list2.length == 0;
+
         client.disconnect();
     }
 }
