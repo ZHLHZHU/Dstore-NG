@@ -1,0 +1,4 @@
+write some sample text in the text box and click on the button to see the result.
+The text will be displayed in the label control on the form.
+but when i click on the button the text is not displayed in the label control.
+I am using visual studio 2010 and .net framework 4.0

@@ -49,7 +49,7 @@ class AnyDoor {
 
     public static int rebalanced_period;
 
-    public static Log logLevel = Log.INFO;
+    public static Log logLevel = Log.TRACE;
 
     public static long timeout = 1000;
 
@@ -181,6 +181,10 @@ class Peer {
         while (true) {
             try {
                 String message = in.readLine();
+                if (message == null) {
+                    Log.INFO.log("Connection closed");
+                    break;
+                }
                 if (type == null) {
                     if (message.startsWith(Protocol.JOIN_TOKEN)) {
                         onJoin(message);
@@ -443,6 +447,7 @@ class ClientHandler implements Handler {
     }
 
     private void onClientStore(String filename, long fileSize) throws InterruptedException {
+        Log.TRACE.log("Store request: %s %d", filename, fileSize);
         if (AnyDoor.onlineDstores.size() < AnyDoor.replicate) {
             Log.ERROR.log("No Dstores available");
             res(Protocol.ERROR_NOT_ENOUGH_DSTORES_TOKEN);
@@ -459,15 +464,17 @@ class ClientHandler implements Handler {
             res(Protocol.ERROR_FILE_ALREADY_EXISTS_TOKEN);
             return;
         }
+        final List<DstoreHandler> candidateDstore = AnyDoor.onlineDstores.values().stream().limit(AnyDoor.replicate).toList();
         FileHandler file = _file.get();
         if (file.getLock().tryLock()) {
             try {
-                file.getWaitingDstores().addAll(AnyDoor.onlineDstores.values().stream().limit(AnyDoor.replicate).toList());
+                file.getWaitingDstores().addAll(candidateDstore);
                 waitStoreFile.set(filename);
             } finally {
                 file.getLock().unlock();
             }
         }
+        res(Protocol.STORE_TO_TOKEN + " " + candidateDstore.stream().map(DstoreHandler::getPort).map(String::valueOf).collect(Collectors.joining(" ")));
     }
 
     private void onClientLoad(String fileName) throws InterruptedException {
@@ -538,7 +545,7 @@ class ClientHandler implements Handler {
         if (fileList.isEmpty()) {
             res(Protocol.LIST_TOKEN);
         } else {
-            res(String.join("%s ", Protocol.LIST_TOKEN, String.join(" ", fileList)));
+            res(Protocol.LIST_TOKEN + " " + String.join(" ", fileList));
         }
     }
 
