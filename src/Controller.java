@@ -744,172 +744,173 @@ class FileHandler {
         return waitingClient;
     }
 }
+
+
+class RebalanceManager {
+
+
+    public boolean startRebalance(String source) {
+        Log.INFO.log("Rebalancing from %s", source)
+        ;
+        if (AnyDoor.onlineDstores.size() < AnyDoor.replicate) {
+            Log.WARN.log("not enough dstore to rebalance");
+            return false;
+        }
+        final List<DstoreHandler> dstoreList = AnyDoor.onlineDstores.values().stream().toList();
+
+        // request all dstore to list files
+        for (DstoreHandler dstoreHandler : dstoreList) {
+            BlockingQueue<Map.Entry<Peer.InMessageType, String>> out = dstoreHandler.getInQueue();
+            try {
+                out.put(new AbstractMap.SimpleImmutableEntry<>(Peer.InMessageType.REQ, Protocol.LIST_TOKEN));
+            } catch (InterruptedException e) {
+                Log.ERROR.log("Error while sending list request");
+                return false;
+            }
+        }
+
+        final List<FileHandler> allFiles = AnyDoor.fileManager.listFiles();
+        final Map<String, List<DstoreHandler>> fileDstoreMap = allFiles.stream().collect(Collectors.toMap(FileHandler::getFileName, FileHandler::getOnDstores));
+
+        final Map<DstoreHandler, List<FileHandler>> dstoreFileMap = new HashMap<>();
+        for (FileHandler file : allFiles) {
+            for (DstoreHandler dstoreHandler : file.getOnDstores()) {
+                dstoreFileMap.putIfAbsent(dstoreHandler, new ArrayList<>());
+                dstoreFileMap.get(dstoreHandler).add(file);
+            }
+        }
+
+        final int fileCount = allFiles.size();
+        final int dstoreCount = dstoreList.size();
+        final double targetCapacity = (double) (AnyDoor.replicate * fileCount) / dstoreCount;
+        final int lowerBound = (int) Math.floor(targetCapacity);
+        final int upperBound = (int) Math.ceil(targetCapacity);
+
+        // Determine which files need to be moved from overloaded to underloaded Dstores
+        final Map<DstoreHandler, Set<String>> dstoreRemoveMap = new HashMap<>();
+        final Map<DstoreHandler, Set<String>> dstoreAddMap = new HashMap<>();
+
+//        // check each file
+//        for (Map.Entry<String, List<DstoreHandler>> entry : fileDstoreMap.entrySet()) {
+//            String file = entry.getKey();
+//            List<DstoreHandler> holders = entry.getValue();
 //
-//class RebalanceManager {
-//
-//
-//    public boolean startRebalance(String source) {
-//        Log.INFO.log("Rebalancing from %s", source)
-//        ;
-//        if (AnyDoor.onlineDstores.size() < AnyDoor.replicate) {
-//            Log.WARN.log("not enough dstore to rebalance");
-//            return false;
-//        }
-//        final List<DstoreHandler> dstoreList = AnyDoor.onlineDstores.values().stream().toList();
-//
-//        // request all dstore to list files
-//        for (DstoreHandler dstoreHandler : dstoreList) {
-//            BlockingQueue<Map.Entry<Peer.InMessageType, String>> out = dstoreHandler.getInQueue();
-//            try {
-//                out.put(new AbstractMap.SimpleImmutableEntry<>(Peer.InMessageType.REQ, Protocol.LIST_TOKEN));
-//            } catch (InterruptedException e) {
-//                Log.ERROR.log("Error while sending list request");
-//                return false;
+//            final Optional<FileHandler> _file = AnyDoor.fileManager.fetch(file);
+//            if (_file.isEmpty()) {
+//                continue;
 //            }
-//        }
-//
-//        final List<FileHandler> allFiles = AnyDoor.fileManager.listFiles();
-//        final Map<String, List<DstoreHandler>> fileDstoreMap = allFiles.stream().collect(Collectors.toMap(FileHandler::getFileName, FileHandler::getOnDstores));
-//
-//        final Map<DstoreHandler, List<FileHandler>> dstoreFileMap = new HashMap<>();
-//        for (FileHandler file : allFiles) {
-//            for (DstoreHandler dstoreHandler : file.getOnDstores()) {
-//                dstoreFileMap.putIfAbsent(dstoreHandler, new ArrayList<>());
-//                dstoreFileMap.get(dstoreHandler).add(file);
+//            FileHandler fileHandler = _file.get();
+//            if (fileHandler.getStatus().intValue() == 2) {
+//                fileHandler.getOnDstores().forEach(d -> dstoreRemoveMap.computeIfAbsent(d, data -> new HashSet<>()).add(file));
+//                continue;
 //            }
-//        }
 //
-//        final int fileCount = allFiles.size();
-//        final int dstoreCount = dstoreList.size();
-//        final double targetCapacity = (double) (AnyDoor.replicate * fileCount) / dstoreCount;
-//        final int lowerBound = (int) Math.floor(targetCapacity);
-//        final int upperBound = (int) Math.ceil(targetCapacity);
+//            if (holders.size() < AnyDoor.replicate) {
+//                // file needs more replicas
+//                final List<DstoreHandler> underloaded = dstoreFileMap.entrySet().stream()
+//                        .filter(e -> !holders.contains(e.getKey()))
+//                        .filter(e -> e.getValue().size() < upperBound)
+//                        .limit(AnyDoor.replicate - holders.size())
+//                        .map(Map.Entry::getKey)
+//                        .collect(Collectors.toList());
 //
-//        // Determine which files need to be moved from overloaded to underloaded Dstores
-//        final Map<DstoreHandler, Set<String>> dstoreRemoveMap = new HashMap<>();
-//        final Map<DstoreHandler, Set<String>> dstoreAddMap = new HashMap<>();
-//
-////        // check each file
-////        for (Map.Entry<String, List<DstoreHandler>> entry : fileDstoreMap.entrySet()) {
-////            String file = entry.getKey();
-////            List<DstoreHandler> holders = entry.getValue();
-////
-////            final Optional<FileHandler> _file = AnyDoor.fileManager.fetch(file);
-////            if (_file.isEmpty()) {
-////                continue;
-////            }
-////            FileHandler fileHandler = _file.get();
-////            if (fileHandler.getStatus().intValue() == 2) {
-////                fileHandler.getOnDstores().forEach(d -> dstoreRemoveMap.computeIfAbsent(d, data -> new HashSet<>()).add(file));
-////                continue;
-////            }
-////
-////            if (holders.size() < AnyDoor.replicate) {
-////                // file needs more replicas
-////                final List<DstoreHandler> underloaded = dstoreFileMap.entrySet().stream()
-////                        .filter(e -> !holders.contains(e.getKey()))
-////                        .filter(e -> e.getValue().size() < upperBound)
-////                        .limit(AnyDoor.replicate - holders.size())
-////                        .map(Map.Entry::getKey)
-////                        .collect(Collectors.toList());
-////
-////                if (holders.size() + underloaded.size() <= AnyDoor.replicate) {
-////                    dstoreList.stream()
-////                            .filter(d -> !holders.contains(d) && !underloaded.contains(d))
-////                            .limit(AnyDoor.replicate - holders.size() - underloaded.size())
-////                            .forEach(underloaded::add);
-////                }
-////                underloaded.forEach(d -> dstoreAddMap.computeIfAbsent(d, data -> new HashSet<>()).add(file));
-////            } else if (holders.size() > AnyDoor.replicate) {
-////                // File has too many replicas
-////                holders.stream()
-////                        .map(h -> Map.entry(h, dstoreFileMap.getOrDefault(h, Collections.emptyList())))
-////                        .filter(e -> e.getValue().size() > lowerBound)
-////                        .map(Map.Entry::getKey)
-////                        .limit(holders.size() - AnyDoor.replicate)
-////                        .forEach(d -> dstoreRemoveMap.computeIfAbsent(d, data -> new HashSet<>()).add(file));
-////            }
-////        }
-//
-//        // calc expected load:  Dstore -> file count
-//        Map<DstoreHandler, Integer> loadMap = new HashMap<>();
-//        for (DstoreHandler dstore : dstoreList) {
-//            int initialLoad = Optional.ofNullable(dstoreFileMap.get(dstore)).map(List::size).orElse(0);
-//            int additions = dstoreAddMap.getOrDefault(dstore, Collections.emptySet()).size();
-//            int removals = dstoreRemoveMap.getOrDefault(dstore, Collections.emptySet()).size();
-//            int netLoad = initialLoad + additions - removals;
-//            loadMap.put(dstore, netLoad);
-//        }
-//
-//        // find high load and low load Dstore List
-//        List<DstoreHandler> highLoadDstores = loadMap.entrySet().stream()
-//                .filter(entry -> entry.getValue() > upperBound)
-//                .map(Map.Entry::getKey)
-//                .toList();
-//        List<DstoreHandler> lowLoadDstores = loadMap.entrySet().stream()
-//                .filter(entry -> entry.getValue() < lowerBound)
-//                .map(Map.Entry::getKey)
-//                .toList();
-//
-//        // transfer files from high load Dstore to low load Dstore
-//        for (DstoreHandler highLoadDstore : highLoadDstores) {
-//            final Set<String> potentialFiles = dstoreFileMap.getOrDefault(highLoadDstore, Collections.emptyList())
-//                    .stream()
-//                    .map(FileHandler::getFileName)
-//                    .collect(Collectors.toSet());
-//            potentialFiles.removeAll(dstoreRemoveMap.getOrDefault(highLoadDstore, Collections.emptySet()));
-//
-//            for (String file : potentialFiles) {
-//                if (loadMap.get(highLoadDstore) > upperBound) {
-//                    for (DstoreHandler lowLoadDstore : lowLoadDstores) {
-//                        if (loadMap.get(lowLoadDstore) < lowerBound) {
-//                            dstoreAddMap.computeIfAbsent(lowLoadDstore, k -> new HashSet<>()).add(file);
-//                            dstoreRemoveMap.computeIfAbsent(highLoadDstore, k -> new HashSet<>()).add(file);
-//
-//                            // update load
-//                            loadMap.put(highLoadDstore, loadMap.get(highLoadDstore) - 1);
-//                            loadMap.put(lowLoadDstore, loadMap.get(lowLoadDstore) + 1);
-//                            break;
-//                        }
-//                    }
+//                if (holders.size() + underloaded.size() <= AnyDoor.replicate) {
+//                    dstoreList.stream()
+//                            .filter(d -> !holders.contains(d) && !underloaded.contains(d))
+//                            .limit(AnyDoor.replicate - holders.size() - underloaded.size())
+//                            .forEach(underloaded::add);
 //                }
+//                underloaded.forEach(d -> dstoreAddMap.computeIfAbsent(d, data -> new HashSet<>()).add(file));
+//            } else if (holders.size() > AnyDoor.replicate) {
+//                // File has too many replicas
+//                holders.stream()
+//                        .map(h -> Map.entry(h, dstoreFileMap.getOrDefault(h, Collections.emptyList())))
+//                        .filter(e -> e.getValue().size() > lowerBound)
+//                        .map(Map.Entry::getKey)
+//                        .limit(holders.size() - AnyDoor.replicate)
+//                        .forEach(d -> dstoreRemoveMap.computeIfAbsent(d, data -> new HashSet<>()).add(file));
 //            }
 //        }
-//
-//        // execute removals and additions
-//        final Set<String> addFiles = dstoreAddMap.values().stream().flatMap(Collection::stream).collect(Collectors.toSet());
-//        for (DstoreHandler dstore : dstoreList) {
-//            final List<String> canSendToOthers = dstore.fileList().stream()
-//                    .filter(addFiles::contains)
-//                    .toList();
-//            final StringBuilder sendFileCmd = new StringBuilder();
-//            for (String file : canSendToOthers) {
-//                List<DstoreHandler> peersDstore = dstoreAddMap.entrySet().stream().filter(e -> e.getValue().contains(file)).map(Map.Entry::getKey).toList();
-//                if (peersDstore.isEmpty()) {
-//                    continue;
-//                }
-//                sendFileCmd.append(" ").append(file).append(" ").append(peersDstore.size());
-//                peersDstore.forEach(peer -> sendFileCmd.append(" ").append(peer.port()));
-//            }
-//
-//            Set<String> removeFiles = dstoreRemoveMap.getOrDefault(dstore, Collections.emptySet());
-//
-//            StringBuilder rebalanceRequest = new StringBuilder();
-//            rebalanceRequest.append(Protocol.REBALANCE_TOKEN).append(" ").append(canSendToOthers.size());
-//            if (!canSendToOthers.isEmpty()) {
-//                rebalanceRequest.append(sendFileCmd);
-//            }
-//            rebalanceRequest.append(" ").append(removeFiles.size());
-//            if (!removeFiles.isEmpty()) {
-//                rebalanceRequest.append(" ").append(String.join(" ", removeFiles));
-//            }
-//
-//
-//            dstore.out().println(rebalanceRequest);
-//            dstore.fileList().removeAll(removeFiles);
-//            dstore.fileList().addAll(canSendToOthers);
-//        }
-//        return false;
-//    }
-//
-//}
+
+        // calc expected load:  Dstore -> file count
+        Map<DstoreHandler, Integer> loadMap = new HashMap<>();
+        for (DstoreHandler dstore : dstoreList) {
+            int initialLoad = Optional.ofNullable(dstoreFileMap.get(dstore)).map(List::size).orElse(0);
+            int additions = dstoreAddMap.getOrDefault(dstore, Collections.emptySet()).size();
+            int removals = dstoreRemoveMap.getOrDefault(dstore, Collections.emptySet()).size();
+            int netLoad = initialLoad + additions - removals;
+            loadMap.put(dstore, netLoad);
+        }
+
+        // find high load and low load Dstore List
+        List<DstoreHandler> highLoadDstores = loadMap.entrySet().stream()
+                .filter(entry -> entry.getValue() > upperBound)
+                .map(Map.Entry::getKey)
+                .toList();
+        List<DstoreHandler> lowLoadDstores = loadMap.entrySet().stream()
+                .filter(entry -> entry.getValue() < lowerBound)
+                .map(Map.Entry::getKey)
+                .toList();
+
+        // transfer files from high load Dstore to low load Dstore
+        for (DstoreHandler highLoadDstore : highLoadDstores) {
+            final Set<String> potentialFiles = dstoreFileMap.getOrDefault(highLoadDstore, Collections.emptyList())
+                    .stream()
+                    .map(FileHandler::getFileName)
+                    .collect(Collectors.toSet());
+            potentialFiles.removeAll(dstoreRemoveMap.getOrDefault(highLoadDstore, Collections.emptySet()));
+
+            for (String file : potentialFiles) {
+                if (loadMap.get(highLoadDstore) > upperBound) {
+                    for (DstoreHandler lowLoadDstore : lowLoadDstores) {
+                        if (loadMap.get(lowLoadDstore) < lowerBound) {
+                            dstoreAddMap.computeIfAbsent(lowLoadDstore, k -> new HashSet<>()).add(file);
+                            dstoreRemoveMap.computeIfAbsent(highLoadDstore, k -> new HashSet<>()).add(file);
+
+                            // update load
+                            loadMap.put(highLoadDstore, loadMap.get(highLoadDstore) - 1);
+                            loadMap.put(lowLoadDstore, loadMap.get(lowLoadDstore) + 1);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // execute removals and additions
+        final Set<String> addFiles = dstoreAddMap.values().stream().flatMap(Collection::stream).collect(Collectors.toSet());
+        for (DstoreHandler dstore : dstoreList) {
+            final List<String> canSendToOthers = dstore.fileList().stream()
+                    .filter(addFiles::contains)
+                    .toList();
+            final StringBuilder sendFileCmd = new StringBuilder();
+            for (String file : canSendToOthers) {
+                List<DstoreHandler> peersDstore = dstoreAddMap.entrySet().stream().filter(e -> e.getValue().contains(file)).map(Map.Entry::getKey).toList();
+                if (peersDstore.isEmpty()) {
+                    continue;
+                }
+                sendFileCmd.append(" ").append(file).append(" ").append(peersDstore.size());
+                peersDstore.forEach(peer -> sendFileCmd.append(" ").append(peer.port()));
+            }
+
+            Set<String> removeFiles = dstoreRemoveMap.getOrDefault(dstore, Collections.emptySet());
+
+            StringBuilder rebalanceRequest = new StringBuilder();
+            rebalanceRequest.append(Protocol.REBALANCE_TOKEN).append(" ").append(canSendToOthers.size());
+            if (!canSendToOthers.isEmpty()) {
+                rebalanceRequest.append(sendFileCmd);
+            }
+            rebalanceRequest.append(" ").append(removeFiles.size());
+            if (!removeFiles.isEmpty()) {
+                rebalanceRequest.append(" ").append(String.join(" ", removeFiles));
+            }
+
+
+            dstore.out().println(rebalanceRequest);
+            dstore.fileList().removeAll(removeFiles);
+            dstore.fileList().addAll(canSendToOthers);
+        }
+        return false;
+    }
+
+}
